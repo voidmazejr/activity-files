@@ -4,6 +4,8 @@ export type NowKind =
   | 'reading'
   | 'editing'
   | 'running'
+  | 'browsing'
+  | 'searching'
   | 'done'
   | 'committed'
 
@@ -13,7 +15,15 @@ export type TouchStatus = 'reading' | 'opened' | 'editing' | 'edited' | 'committ
 
 export type Touched = { path: string; status: TouchStatus }
 
-export type GitFile = { code: string; add: number; del: number }
+/** A web page Claude read, or a web search it ran, in this task. */
+export type WebVisit = {
+  kind: 'page' | 'search'
+  /** the page's address, or the search's words */
+  target: string
+  isLive: boolean
+}
+
+export type GitFile ={ code: string; add: number; del: number }
 
 export type GitInfo = {
   repo: string
@@ -51,6 +61,7 @@ declare module 'claude-code' {
     'activity-monitor': {
       now: Shaped<Now>
       touched: Shaped<Touched[]>
+      web: Shaped<WebVisit[]>
       git: Shaped<GitInfo>
       view: Shaped<View>
       settings: Shaped<PaneSettings>

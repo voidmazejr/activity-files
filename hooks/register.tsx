@@ -1,13 +1,38 @@
 import { atom, read, update } from 'claude-code'
 import type { ClientProps, ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
 
-import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View } from '../types'
+import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View, WebVisit } from '../types'
 import type { HitProps } from "./hit"
 
 const PANE = 'activity-monitor'
 
 const nowAtom = atom({ plugin: 'activity-monitor', key: 'now' } as const, { kind: 'idle', title: 'Waiting for a task', sub: 'no files touched yet' } as Now, { shape: 'now-1' })
 const touchedAtom = atom({ plugin: 'activity-monitor', key: 'touched' } as const, [] as Touched[], { shape: 'touched-1' })
+const webAtom = atom({ plugin: 'activity-monitor', key: 'web' } as const, [] as WebVisit[], { shape: 'web-1' })
+
+// The web: WebFetch (a page), WebSearch (a search), and any browser tool
+// that goes to an address (the in-app browser's or Chrome's navigate).
+function webOf(tool: string, input: Record<string, unknown>): Omit<WebVisit, 'isLive'> | undefined {
+  if (tool === 'WebSearch' && typeof input.query === 'string') return { kind: 'search', target: input.query }
+  const url = input.url
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return undefined
+  if (tool === 'WebFetch' || /(^|__)(navigate|preview_start)$/.test(tool)) return { kind: 'page', target: url }
+  return undefined
+}
+
+// An address split for display: the site, then the rest of the path.
+const siteOf = (url: string) => {
+  const m = /^https?:\/\/(?:www\.)?([^/?#]+)([^?#]*)/i.exec(url)
+  return { host: m?.[1] ?? url, path: (m?.[2] ?? '').replace(/\/$/, '') }
+}
+
+async function setWeb($: Dollar, visit: Omit<WebVisit, 'isLive'>, isLive: boolean) {
+  await update($, webAtom, list => {
+    const rest = list.filter(v => !(v.kind === visit.kind && v.target === visit.target))
+    return [...rest, { ...visit, isLive }].slice(-30)
+  })
+}
+
 const gitAtom = atom({ plugin: 'activity-monitor', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
 const viewAtom = atom(
   { plugin: 'activity-monitor', key: 'view' } as const,
@@ -43,6 +68,7 @@ const C = {
   green: '#4ade80',
   red: '#f87171',
   blue: '#6cb6ff',
+  teal: '#5eead4',
 }
 
 const STATUS: Record<TouchStatus, { label: string; color: string }> = {
@@ -60,6 +86,8 @@ const PATHS = {
   reading: 'M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12M12 9a3 3 0 1 0 0 6 3 3 0 1 0 0-6',
   editing: 'M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z',
   running: 'm4 17 6-6-6-6M12 19h8',
+  browsing: 'M12 2a10 10 0 1 0 0 20 10 10 0 1 0 0-20M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10',
+  searching: 'M11 4a7 7 0 1 0 0 14 7 7 0 1 0 0-14M20 20l-4-4',
   done: 'M20 6 9 17l-5-5',
   committed: 'M20 6 9 17l-5-5',
   idle: 'M12 3v18M4.2 7.5l15.6 9M4.2 16.5l15.6-9',
@@ -74,6 +102,8 @@ const NOW_STYLE: Record<Now['kind'], { label: string; color: string }> = {
   reading: { label: 'RIGHT NOW', color: C.purple },
   editing: { label: 'RIGHT NOW', color: C.orange },
   running: { label: 'RIGHT NOW', color: C.blue },
+  browsing: { label: 'RIGHT NOW', color: C.teal },
+  searching: { label: 'RIGHT NOW', color: C.teal },
   done: { label: 'DONE', color: C.green },
   committed: { label: 'DONE', color: C.green },
 }
@@ -93,6 +123,30 @@ const circleIcon = (d: string, color: string, isLive: boolean) =>
       : '') +
       `<circle cx="24" cy="24" r="20" fill="${color}" fill-opacity="0.16"/><g transform="translate(12 12)" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></g>`,
   )
+
+// A solid colour for the terminal, which takes no transparency: `color` laid
+// over the pane's dark ground at `alpha`.
+const GROUND = [0x1c, 0x1c, 0x1c]
+const tint = (color: string, alpha: number) => {
+  const m = /^#([0-9a-f]{6})/i.exec(color)
+  if (!m || !m[1]) return undefined
+  const n = parseInt(m[1], 16)
+  const rgb = [(n >> 16) & 255, (n >> 8) & 255, n & 255]
+  return '#' + rgb.map((c, i) => Math.round((GROUND[i] ?? 0) * (1 - alpha) + c * alpha).toString(16).padStart(2, '0')).join('')
+}
+
+// The status symbol in the terminal, in place of the drawn round icon.
+const NOW_GLYPH: Record<Now['kind'], string> = {
+  idle: '✻',
+  thinking: '✻',
+  reading: '◉',
+  editing: '✎',
+  running: '▸',
+  browsing: '◍',
+  searching: '⌕',
+  done: '✓',
+  committed: '✓',
+}
 
 // A small label with rounded corners, the same height as a line of text: a
 // soft fill and the word in the label's colour. Badges (JS, MD) are a little
@@ -368,7 +422,10 @@ export const register: Register = on => {
     closeTimer = undefined
     const s = await read($, settingsAtom)
     if (s.autoOpen) void openPane($)
-    if (s.resetEachTask) await update($, touchedAtom, () => [])
+    if (s.resetEachTask) {
+      await update($, touchedAtom, () => [])
+      await update($, webAtom, () => [])
+    }
     await update($, nowAtom, () => ({ kind: 'thinking', title: 'Claude is thinking', sub: 'no files touched yet' }))
     return next(e)
   })
@@ -382,6 +439,20 @@ export const register: Register = on => {
     const where = (p: string) => {
       const d = shortDir(root, dirOf(p))
       return d ? `in ${d}` : `in ${base(root)}`
+    }
+
+    const visit = webOf(tool, input)
+    if (visit) {
+      const { host, path: rest } = siteOf(visit.target)
+      await setWeb($, visit, true)
+      await update($, nowAtom, () =>
+        visit.kind === 'search'
+          ? { kind: 'searching', title: 'Claude is searching the web', sub: `“${visit.target}”` }
+          : { kind: 'browsing', title: `Claude is reading ${host}`, sub: rest || visit.target },
+      )
+      const ran = await next(e)
+      await setWeb($, visit, false)
+      return ran
     }
 
     if (path && READERS.has(tool)) {
@@ -506,23 +577,32 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button, Input } = els
-    const Svg = 'Svg' in els ? (els as { Svg: ElementConstructor<SvgProps> }).Svg : null
-    const Client = "Client" in els ? (els as { Client: ElementConstructor<ClientProps> }).Client : null
+    // The terminal draws no pictures: there every drawn icon, pill and
+    // animation has a text twin (a coloured symbol, a tinted chip).
+    const isGui = e.surface !== 'terminal'
+    const Svg = isGui && 'Svg' in els ? (els as { Svg: ElementConstructor<SvgProps> }).Svg : null
+    const Client = isGui && 'Client' in els ? (els as { Client: ElementConstructor<ClientProps> }).Client : null
+    // Card look per surface: the terminal takes solid colours only and has
+    // no room to spare, so its cards have dim solid borders and no blank rows.
+    const K = isGui
+      ? { border: C.border, hot: C.borderHot, card: C.card as string | undefined, padY: 1, gap: 1 }
+      : { border: '#3c3c3c', hot: '#a0a0a0', card: undefined, padY: 0, gap: 0 }
 
-    const [now, touched, g, view, settings] = await Promise.all([
+    const [now, touched, g, view, settings, web] = await Promise.all([
       read($, nowAtom),
       read($, touchedAtom),
       read($, gitAtom),
       read($, viewAtom),
       read($, settingsAtom),
+      read($, webAtom),
     ])
     const animate = settings.animations
     const root = view.root || (await $.session.cwd())
     const icon = (d: string, color: string, size: number, glyph: string) =>
       Svg ? <Svg source={lineIcon(d, color, size)} alt={glyph} width={size} height={size} /> : <Text color={color}>{glyph}</Text>
 
-    // Rounded chips, drawn like the cards: a round border and a soft fill.
-    const isGui = e.surface !== "terminal"
+    // Labels: a small rounded drawing on the desktop; in the terminal a chip
+    // of text on a soft tint of its colour, the closest a terminal gets.
     const chip = (key: string, text: string, color: string, mono = false, isLive = false) =>
       isGui && Svg ? (
         <Box key={key}>
@@ -535,15 +615,15 @@ export const register: Register = on => {
       ) : isGui ? (
         <Text size="caption" mono={mono} weight="bold" color={color} backgroundColor={`${color}22`}>{` ${text} `}</Text>
       ) : (
-        <Text weight="bold" color={color}>{text}</Text>
+        <Text weight="bold" color={color} backgroundColor={tint(color, 0.2)}>{` ${text} `}</Text>
       )
-    const anim = (key: string, source: string, width: number, height: number, alt: string) =>
+    const anim =(key: string, source: string, width: number, height: number, alt: string) =>
       Svg ? <Svg key={key} source={source} alt={alt} width={width} height={height} isInteractive /> : null
 
     const setView = (fn: (v: View) => View) => () => void update($, viewAtom, fn)
     const changedPaths = Object.keys(g.files)
     const changedCount = changedPaths.length
-    const isWorking = now.kind === 'reading' || now.kind === 'editing' || now.kind === 'running'
+    const isWorking = ['reading', 'editing', 'running', 'browsing', 'searching'].includes(now.kind)
     const ns = NOW_STYLE[now.kind]
 
     // ----- Right now card -----
@@ -552,17 +632,20 @@ export const register: Register = on => {
         key="now"
         flexDirection="column"
         borderStyle="round"
-        borderColor={isWorking ? C.borderHot : C.border}
-        backgroundColor={C.card}
+        borderColor={isWorking ? K.hot : K.border}
+        backgroundColor={K.card}
         paddingX={2}
-        paddingY={1}
-        gap={1}
+        paddingY={K.padY}
+        gap={K.gap}
       >
         <Box flexDirection="row" gap={2} alignItems="center">
           {Svg ? (
             <Svg source={circleIcon(PATHS[now.kind], ns.color === C.muted ? '#cfcfcf' : ns.color, animate && (isWorking || now.kind === "thinking"))} alt={now.kind} width={44} height={44} isInteractive />
           ) : (
-            <Text color={ns.color}>●</Text>
+            // The round icon's twin: its symbol on a tint of its colour.
+            <Text bold color={ns.color === C.muted ? '#cfcfcf' : ns.color} backgroundColor={tint(ns.color === C.muted ? '#cfcfcf' : ns.color, 0.18)}>
+              {` ${NOW_GLYPH[now.kind]} `}
+            </Text>
           )}
           <Box flexDirection="column">
             <Text size="caption" weight="bold" color={ns.color === C.muted ? C.muted : ns.color}>
@@ -576,7 +659,7 @@ export const register: Register = on => {
             </Text>
           </Box>
         </Box>
-        <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column" gap={K.gap}>
           <Box flexDirection="row" justifyContent="space-between" alignItems="center">
             <Box flexDirection="row" gap={1} alignItems="center">
               {icon(PATHS.branch, C.blue, 16, '⎇')}
@@ -601,7 +684,7 @@ export const register: Register = on => {
 
     // ----- search + buttons -----
     const search = (
-      <Box flexDirection="row" alignItems="center" gap={1} borderStyle="round" borderColor={C.border} paddingX={1}>
+      <Box flexDirection="row" alignItems="center" gap={1} borderStyle="round" borderColor={K.border} paddingX={1}>
         {icon(PATHS.search, C.muted, 16, '⌕')}
         <Input
           key="find"
@@ -661,7 +744,7 @@ export const register: Register = on => {
       </Box>
     )
     const settingsCard = (
-      <Box key="settings" flexDirection="column" borderStyle="round" borderColor={C.border} backgroundColor={C.card} paddingX={2} paddingY={1} gap={1}>
+      <Box key="settings" flexDirection="column" borderStyle="round" borderColor={K.border} backgroundColor={K.card} paddingX={2} paddingY={K.padY} gap={K.gap}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
           <Text size="caption" weight="bold" color={C.muted}>SETTINGS</Text>
           <Button key="settings-done" plain onPress={setView(v => ({ ...v, showSettings: false }))}>
@@ -689,11 +772,11 @@ export const register: Register = on => {
         key="touched"
         flexDirection="column"
         borderStyle="round"
-        borderColor={now.kind === 'committed' ? C.borderHot : C.border}
-        backgroundColor={C.card}
+        borderColor={now.kind === 'committed' ? K.hot : K.border}
+        backgroundColor={K.card}
         paddingX={2}
-        paddingY={1}
-        gap={1}
+        paddingY={K.padY}
+        gap={K.gap}
       >
         <Box flexDirection="row" justifyContent="space-between">
           <Text size="caption" weight="bold" color={C.muted}>CLAUDE TOUCHED</Text>
@@ -732,6 +815,51 @@ export const register: Register = on => {
             )
           })
         )}
+      </Box>
+    )
+
+    // ----- Web card: pages Claude read and searches it ran, this task -----
+    // Shown only once there is something in it.
+    const webCard = web.length > 0 && (
+      <Box
+        key="web"
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={web.some(v => v.isLive) ? K.hot : K.border}
+        backgroundColor={K.card}
+        paddingX={2}
+        paddingY={K.padY}
+        gap={K.gap}
+      >
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text size="caption" weight="bold" color={C.muted}>CLAUDE ON THE WEB</Text>
+          <Text size="caption" weight="bold" color={C.muted}>
+            {web.length} {web.length === 1 ? 'VISIT' : 'VISITS'}
+          </Text>
+        </Box>
+        {web.map(v => {
+          const isSearch = v.kind === 'search'
+          const { host, path: rest } = siteOf(v.target)
+          const pill = isSearch ? (v.isLive ? 'Searching' : 'Searched') : v.isLive ? 'Reading' : 'Read'
+          return (
+            <Box key={`w:${v.kind}:${v.target}`} flexDirection="row" justifyContent="space-between" alignItems="center" paddingLeft={2} gap={1}>
+              <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1} minWidth={0}>
+                {chip(`wb:${v.kind}:${v.target}`, isSearch ? 'FIND' : 'WEB', C.teal, true)}
+                <Box flexShrink={isSearch ? 1 : 0} minWidth={0}>
+                  <Text weight="bold" color={C.fg} wrap="truncate-end">
+                    {isSearch ? `“${v.target}”` : host}
+                  </Text>
+                </Box>
+                {!isSearch && rest && (
+                  <Box flexShrink={1} minWidth={0}>
+                    <Text color={C.muted} wrap="truncate-end">{rest}</Text>
+                  </Box>
+                )}
+              </Box>
+              <Box flexShrink={0}>{chip(`wp:${v.kind}:${v.target}`, pill, C.teal, false, v.isLive && animate)}</Box>
+            </Box>
+          )
+        })}
       </Box>
     )
 
@@ -839,6 +967,9 @@ export const register: Register = on => {
             alignItems="center"
             paddingLeft={r.depth * 2}
             paddingRight={1}
+            // The terminal can't animate the sweep: there the live row is a
+            // soft tint of its colour instead.
+            backgroundColor={isLive && !isGui ? tint(STATUS[st!].color, 0.14) : undefined}
           >
             {isLive && animate && Svg && (
               // Behind the whole row: a band of light sweeps from the name to
@@ -849,9 +980,18 @@ export const register: Register = on => {
               </Box>
             )}
             <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1}>
-              {isLive && animate && Svg ? anim(`d:${r.path}`, liveDot(STATUS[st!].color), 14, 14, "live") : <Text color={C.faint}>{r.isDir ? (isOpen ? "▾" : "▸") : " "}</Text>}
+              {isLive && animate && Svg ? (
+                anim(`d:${r.path}`, liveDot(STATUS[st!].color), 14, 14, 'live')
+              ) : isLive ? (
+                <Text color={STATUS[st!].color}>●</Text>
+              ) : (
+                // In the terminal the chevron takes the folder icon's colour.
+                <Text color={!isGui && r.isDir ? (under ? C.yellow : isDot ? C.muted : C.blue) : C.faint}>
+                  {r.isDir ? (isOpen ? '▾' : '▸') : ' '}
+                </Text>
+              )}
               {r.isDir ? (
-                icon(PATHS.folder, under ? C.yellow : isDot ? C.muted : C.blue, 18, '▤')
+                Svg ? icon(PATHS.folder, under ? C.yellow : isDot ? C.muted : C.blue, 18, '▤') : null
               ) : (
                 chip(`fb:${r.path}`, label, color, true)
               )}
@@ -881,6 +1021,7 @@ export const register: Register = on => {
         ) : (
           <Box flexDirection="column" gap={1}>
             {touchedCard}
+            {webCard}
             {search}
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1} marginTop={1} gap={1}>
               <Box flexDirection="row" gap={1} flexShrink={1} minWidth={0}>

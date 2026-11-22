@@ -46,7 +46,7 @@ test('the pane follows a read and an edit, on every surface', async ($, on) => {
         liveChecks.push(
           !!(surface === 'desktop'
             ? await ui.find({ type: 'Box', key: 'rp:/w/src/client.js' })
-            : await ui.find({ type: 'Text', text: /^editing$/ })),
+            : await ui.find({ type: 'Text', text: /^\s*editing\s*$/ })),
         )
         await ui.unmount()
       }
@@ -134,4 +134,37 @@ test('settings change from the pane and are kept for the next session', async ($
   expect((await ui.find({ type: 'Button', key: 's:anim' }))?.text).toBe('Off')
   expect(stored.settings).toEqual(expect.objectContaining({ closeAfter: 8, animations: false }))
   await ui.unmount()
+})
+
+test('web pages and searches show in the status card and the web card', async ($, on) => {
+  mock.store(on)
+  on('command.register', () => ({ value: { command: 'files' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  const during: string[] = []
+  on('tool.call', async (_, e) => {
+    if (e.tool === 'WebFetch') {
+      const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+      during.push((await ui.find({ type: 'Text', text: /Claude is reading/ }))?.text ?? '')
+      await ui.unmount()
+    }
+    return { result: {} }
+  })
+
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'WebSearch', query: 'claude code mods' })
+  await $.tool.call({ tool: 'WebFetch', url: 'https://www.example.com/docs/page', prompt: 'read it' })
+  expect(during).toEqual(['Claude is reading example.com'])
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /CLAUDE ON THE WEB/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /claude code mods/ })).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /^example\.com$/ }))?.text).toBe('example.com')
+    expect((await ui.find({ type: 'Text', text: /^\/docs\/page$/ }))?.text).toBe('/docs/page')
+    await ui.unmount()
+  }
 })
