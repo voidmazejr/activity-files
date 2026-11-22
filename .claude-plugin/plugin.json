@@ -1,0 +1,6 @@
+{
+  "name": "activity-files",
+  "version": "0.1.0",
+  "description": "A card-style file pane: what Claude is doing right now, the files it touched, and a git-aware file tree",
+  "types": "./types/index.d.ts"
+}

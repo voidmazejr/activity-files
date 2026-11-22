@@ -1,0 +1,5 @@
+{
+  "name": "activity-files",
+  "owner": { "name": "voidmazejr" },
+  "plugins": [{ "name": "activity-files", "source": "./" }]
+}
