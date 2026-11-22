@@ -26,10 +26,22 @@ export type GitInfo = {
 export type View = {
   root: string
   expanded: string[]
-  showHidden: boolean
-  showSizes: boolean
   query: string
-  tick: number
+  showSettings: boolean
+}
+
+export type PaneSettings = {
+  /** open the pane when Claude starts working */
+  autoOpen: boolean
+  /** seconds after Claude finishes before the pane closes; 0 keeps it open */
+  closeAfter: number
+  /** the pulsing dot, the row sweep and the breathing status icon */
+  animations: boolean
+  showHidden: boolean
+  /** what the tree's right column shows for a file */
+  column: 'time' | 'size'
+  /** start "Claude touched" empty on each new task */
+  resetEachTask: boolean
 }
 
 declare module 'claude-code' {
@@ -39,6 +51,7 @@ declare module 'claude-code' {
       touched: Shaped<Touched[]>
       git: Shaped<GitInfo>
       view: Shaped<View>
+      settings: Shaped<PaneSettings>
     }
   }
 }

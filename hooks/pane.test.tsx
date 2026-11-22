@@ -23,6 +23,7 @@ const FILES: Record<string, { name: string; kind: 'file' | 'dir' }[]> = {
 }
 
 test('the pane follows a read and an edit, on every surface', async ($, on) => {
+  mock.store(on)
   on('command.register', () => ({ value: { command: 'files' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.cwd', () => ({ value: '/w' }))
@@ -69,6 +70,7 @@ test('the pane follows a read and an edit, on every surface', async ($, on) => {
 })
 
 test('the pane opens with a turn and closes a few seconds after it', async ($, on) => {
+  mock.store(on)
   const clock = mock.clock(on)
   const events: string[] = []
   on('command.register', () => ({ value: { command: 'files' } }))
@@ -99,4 +101,33 @@ test('the pane opens with a turn and closes a few seconds after it', async ($, o
   expect(events).toEqual(['open'])
   await clock.advance(1500)
   expect(events).toEqual(['open', 'close'])
+})
+
+test('settings change from the pane and are kept for the next session', async ($, on) => {
+  const stored: Record<string, unknown> = {}
+  on('store.get', (_, e) => ({ value: stored[String((e as { key: string }).key)] }))
+  on('store.set', (_, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    stored[key] = value
+    return { value: undefined }
+  })
+  on('command.register', () => ({ value: { command: 'files' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  expect(await ui.find({ type: 'Text', text: /SETTINGS/ })).toBeTruthy()
+  expect((await ui.find({ type: 'Button', key: 's:close' }))?.text).toBe('4 s')
+
+  await ui.press({ key: 's:close' })
+  expect((await ui.find({ type: 'Button', key: 's:close' }))?.text).toBe('8 s')
+  await ui.press({ key: 's:anim' })
+  expect((await ui.find({ type: 'Button', key: 's:anim' }))?.text).toBe('Off')
+  expect(stored.settings).toEqual(expect.objectContaining({ closeAfter: 8, animations: false }))
+  await ui.unmount()
 })

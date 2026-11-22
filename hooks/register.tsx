@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
 
-import type { GitFile, GitInfo, Now, Touched, TouchStatus, View } from '../types'
+import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View } from '../types'
 
 const PANE = 'activity-files'
 
@@ -10,9 +10,22 @@ const touchedAtom = atom({ plugin: 'activity-files', key: 'touched' } as const, 
 const gitAtom = atom({ plugin: 'activity-files', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
 const viewAtom = atom(
   { plugin: 'activity-files', key: 'view' } as const,
-  { root: '', expanded: [], showHidden: true, showSizes: false, query: '', tick: 0 } as View,
-  { shape: 'view-1' },
+  { root: '', expanded: [], query: '', showSettings: false } as View,
+  { shape: 'view-2' },
 )
+
+// PaneSettings live in $.store too, so they carry over to every new session.
+const DEFAULT_SETTINGS: PaneSettings = {
+  autoOpen: true,
+  closeAfter: 4,
+  animations: true,
+  showHidden: true,
+  column: 'time',
+  resetEachTask: true,
+}
+const STORE_KEY = 'settings'
+const settingsAtom = atom({ plugin: 'activity-files', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-1' })
+const CLOSE_STEPS = [2, 4, 8, 15, 0]
 
 // ---------- colours (picked to match the video) ----------
 const C = {
@@ -245,9 +258,34 @@ async function reveal($: Dollar, path: string) {
   if (add.length) await update($, viewAtom, v => ({ ...v, expanded: [...v.expanded, ...add] }))
 }
 
+// A folder for display: inside the project, relative to it; outside, the last
+// two folders, so a long absolute path never pushes the row out of its card.
+const shortDir = (root: string, dir: string) => {
+  if (dir === root) return ''
+  if (dir.startsWith(root + '/')) return dir.slice(root.length + 1)
+  const parts = dir.replace(/^\/(Users|home)\/[^/]+/, '~').split('/').filter(Boolean)
+  return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : parts.join('/')
+}
+
+async function saveSettings($: Dollar, change: (s: PaneSettings) => PaneSettings) {
+  const next = await update($, settingsAtom, change)
+  await $.store.set(STORE_KEY, next)
+}
+
+// Which repository a shell command commits in: a leading `cd <dir>` or
+// `git -C <dir>`, else the folder the pane shows.
+function commitDir(cmd: string, root: string) {
+  const m = /(?:^|&&|;)\s*cd\s+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(cmd) ?? /\bgit\s+-C\s+(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(cmd)
+  const dir = m ? (m[1] ?? m[2] ?? m[3] ?? '') : ''
+  if (!dir) return root
+  const home = /^\/(?:Users|home)\/[^/]+/.exec(root)?.[0] ?? ''
+  const abs = dir.startsWith('~') ? home + dir.slice(1) : dir.startsWith('/') ? dir : join(root, dir)
+  return abs
+}
+
 // The pane opens when Claude starts working and closes on its own a few
-// seconds after Claude finishes. /files opens it by hand, and then it stays.
-const CLOSE_AFTER_MS = 4000
+// seconds after Claude finishes (both in the settings). /files opens it by
+// hand, and then it stays.
 let closeTimer: Timer | undefined
 
 async function openPane($: Dollar) {
@@ -258,25 +296,34 @@ async function openPane($: Dollar) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'files', description: 'Open the activity file pane' })
+    await $.command.register({
+      name: 'files',
+      description: 'Open the activity file pane; /files settings opens its settings',
+      argumentHint: '[settings]',
+    })
     const cwd = await $.session.cwd()
     await update($, viewAtom, v => ({ ...v, root: v.root || cwd }))
+    const saved = (await $.store.get(STORE_KEY)) as Partial<PaneSettings> | undefined
+    await update($, settingsAtom, () => ({ ...DEFAULT_SETTINGS, ...(saved ?? {}) }))
     void refreshGit($)
     return next(e)
   })
 
-  on('command.run', { command: 'files' }, async $ => {
+  on('command.run', { command: 'files' }, async ($, e) => {
     closeTimer?.cancel()
     closeTimer = undefined
+    const wantsSettings = /\bsettings?\b|\bconfig\b/i.test(String((e as { args?: unknown }).args ?? ''))
+    await update($, viewAtom, v => ({ ...v, showSettings: wantsSettings }))
     await openPane($)
-    return { text: 'Files pane opened.' }
+    return { text: wantsSettings ? 'Files settings opened.' : 'Files pane opened.' }
   })
 
   on('turn.start', async ($, e, next) => {
     closeTimer?.cancel()
     closeTimer = undefined
-    void openPane($)
-    await update($, touchedAtom, () => [])
+    const s = await read($, settingsAtom)
+    if (s.autoOpen) void openPane($)
+    if (s.resetEachTask) await update($, touchedAtom, () => [])
     await update($, nowAtom, () => ({ kind: 'thinking', title: 'Claude is thinking', sub: 'no files touched yet' }))
     return next(e)
   })
@@ -288,7 +335,7 @@ export const register: Register = on => {
     const view = await read($, viewAtom)
     const root = view.root
     const where = (p: string) => {
-      const d = rel(root, dirOf(p))
+      const d = shortDir(root, dirOf(p))
       return d ? `in ${d}` : `in ${base(root)}`
     }
 
@@ -301,7 +348,7 @@ export const register: Register = on => {
       await update($, nowAtom, () => ({
         kind: 'reading',
         title: isDir ? `Claude is searching ${base(path)}` : `Claude is reading ${base(path)}`,
-        sub: isDir ? `in ${rel(root, path) || base(root)}` : where(path),
+        sub: isDir ? `in ${shortDir(root, path) || base(root)}` : where(path),
       }))
       const ran = await next(e)
       if (!isDir) await setTouched($, path, 'opened')
@@ -326,15 +373,23 @@ export const register: Register = on => {
         title: isCommit ? 'Claude is committing' : 'Claude is running a command',
         sub: cmd.length > 60 ? cmd.slice(0, 57) + '…' : cmd,
       }))
+      // Only a commit that really happened, in the repository the command ran
+      // in: compare that repository's HEAD before and after.
+      const dir = isCommit ? commitDir(cmd, root) : root
+      const before = isCommit ? (await git($, dir, ['rev-parse', 'HEAD']))?.trim() : undefined
       const ran = await next(e)
       await refreshGit($)
       if (isCommit) {
-        const g = await read($, gitAtom)
-        const sha = (await git($, g.repo || root, ['log', '-1', '--format=%h']))?.trim() ?? ''
-        const names = ((await git($, g.repo || root, ['show', '--name-only', '--format=', 'HEAD'])) ?? '')
-          .split('\n')
-          .filter(Boolean)
-          .map(n => join(g.repo || root, n))
+        const after = (await git($, dir, ['rev-parse', 'HEAD']))?.trim()
+        const top = (await git($, dir, ['rev-parse', '--show-toplevel']))?.trim() ?? dir
+        const isNew = !!after && after !== before
+        const sha = isNew ? after.slice(0, 7) : ''
+        const names = isNew
+          ? ((await git($, dir, ['show', '--name-only', '--format=', 'HEAD'])) ?? '')
+              .split('\n')
+              .filter(Boolean)
+              .map(n => join(top, n))
+          : []
         if (sha && names.length) {
           await update($, touchedAtom, list => {
             const seen = new Set(list.map(t => t.path))
@@ -372,10 +427,16 @@ export const register: Register = on => {
     })
     void refreshGit($)
     closeTimer?.cancel()
-    closeTimer = $.clock.after(CLOSE_AFTER_MS, () => {
-      closeTimer = undefined
-      void $.ui.close({ id: PANE }).catch(() => {})
-    })
+    closeTimer = undefined
+    const s = await read($, settingsAtom)
+    const view = await read($, viewAtom)
+    // Never close the pane under someone changing the settings.
+    if (s.closeAfter > 0 && !view.showSettings) {
+      closeTimer = $.clock.after(s.closeAfter * 1000, () => {
+        closeTimer = undefined
+        void $.ui.close({ id: PANE }).catch(() => {})
+      })
+    }
     return next(e)
   })
 
@@ -384,12 +445,14 @@ export const register: Register = on => {
     const { Box, Text, Button, Input } = els
     const Svg = 'Svg' in els ? (els as { Svg: ElementConstructor<SvgProps> }).Svg : null
 
-    const [now, touched, g, view] = await Promise.all([
+    const [now, touched, g, view, settings] = await Promise.all([
       read($, nowAtom),
       read($, touchedAtom),
       read($, gitAtom),
       read($, viewAtom),
+      read($, settingsAtom),
     ])
+    const animate = settings.animations
     const root = view.root || (await $.session.cwd())
     const icon = (d: string, color: string, size: number, glyph: string) =>
       Svg ? <Svg source={lineIcon(d, color, size)} alt={glyph} width={size} height={size} /> : <Text color={color}>{glyph}</Text>
@@ -433,7 +496,7 @@ export const register: Register = on => {
       >
         <Box flexDirection="row" gap={2} alignItems="center">
           {Svg ? (
-            <Svg source={circleIcon(PATHS[now.kind], ns.color === C.muted ? '#cfcfcf' : ns.color, isWorking || now.kind === "thinking")} alt={now.kind} width={44} height={44} isInteractive />
+            <Svg source={circleIcon(PATHS[now.kind], ns.color === C.muted ? '#cfcfcf' : ns.color, animate && (isWorking || now.kind === "thinking"))} alt={now.kind} width={44} height={44} isInteractive />
           ) : (
             <Text color={ns.color}>●</Text>
           )}
@@ -486,26 +549,52 @@ export const register: Register = on => {
       </Box>
     )
 
-    const btn = (key: string, label: string, onPress: () => void) => (
-      <Button key={key} onPress={onPress}>
-        {label}
+    // Two small icon buttons in the "All files" header: collapse and settings.
+    // A button's label is text, so each icon is one symbol.
+    const iconBtn = (key: string, glyph: string, onPress: () => void, isOn = false) => (
+      <Button key={key} plain onPress={onPress}>
+        <Text color={isOn ? C.fg : C.muted} weight="bold">{glyph}</Text>
       </Button>
     )
-    const buttons = (
-      <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        {btn('refresh', 'Refresh', () => {
-          void refreshGit($)
-          void update($, viewAtom, v => ({ ...v, tick: v.tick + 1 }))
-        })}
-        {btn('collapse', 'Collapse all', setView(v => ({ ...v, expanded: [] })))}
-        {btn('sizes', view.showSizes ? 'Show times' : 'Show sizes', setView(v => ({ ...v, showSizes: !v.showSizes })))}
-        {btn('up', 'Up a folder', () => {
-          void update($, viewAtom, v => ({ ...v, root: dirOf(v.root || root), expanded: [] })).then(() => refreshGit($))
-        })}
-        {btn('home', 'Back to project', () => {
-          void $.session.cwd().then(cwd => update($, viewAtom, v => ({ ...v, root: cwd, expanded: [] }))).then(() => refreshGit($))
-        })}
-        {btn('hidden', view.showHidden ? 'Hide hidden files' : 'Show hidden files', setView(v => ({ ...v, showHidden: !v.showHidden })))}
+    const headerButtons = (
+      <Box flexDirection="row" gap={1} alignItems="center">
+        {iconBtn('collapse', '⊟', setView(v => ({ ...v, expanded: [] })))}
+        {iconBtn('settings', '⚙', setView(v => ({ ...v, showSettings: !v.showSettings })), view.showSettings)}
+      </Box>
+    )
+
+    // ----- settings card -----
+    const set = (change: (s: PaneSettings) => PaneSettings) => () => void saveSettings($, change)
+    const onOff = (b: boolean) => (b ? 'On' : 'Off')
+    const settingRow = (key: string, label: string, value: string, onPress: () => void, hint?: string) => (
+      <Box key={`sr:${key}`} flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text color={C.fg}>{label}</Text>
+          {hint && <Text size="footnote" color={C.muted} wrap="truncate-end">{hint}</Text>}
+        </Box>
+        <Button key={`s:${key}`} onPress={onPress}>{value}</Button>
+      </Box>
+    )
+    const settingsCard = (
+      <Box key="settings" flexDirection="column" borderStyle="round" borderColor={C.border} backgroundColor={C.card} paddingX={2} paddingY={1} gap={1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text size="caption" weight="bold" color={C.muted}>SETTINGS</Text>
+          <Button key="settings-done" plain onPress={setView(v => ({ ...v, showSettings: false }))}>
+            <Text color={C.muted} weight="bold">Done</Text>
+          </Button>
+        </Box>
+        {settingRow('open', 'Open when Claude starts', onOff(settings.autoOpen), set(s => ({ ...s, autoOpen: !s.autoOpen })))}
+        {settingRow(
+          'close',
+          'Close after Claude finishes',
+          settings.closeAfter ? `${settings.closeAfter} s` : 'Never',
+          set(s => ({ ...s, closeAfter: CLOSE_STEPS[(CLOSE_STEPS.indexOf(s.closeAfter) + 1) % CLOSE_STEPS.length] ?? 4 })),
+        )}
+        {settingRow('anim', 'Animations', onOff(settings.animations), set(s => ({ ...s, animations: !s.animations })))}
+        {settingRow('reset', 'Clear the touched list each task', onOff(settings.resetEachTask), set(s => ({ ...s, resetEachTask: !s.resetEachTask })))}
+        {settingRow('hidden', 'Hidden files', settings.showHidden ? 'Shown' : 'Hidden', set(s => ({ ...s, showHidden: !s.showHidden })))}
+        {settingRow('column', 'Right column', settings.column === 'time' ? 'Time' : 'Size', set(s => ({ ...s, column: s.column === 'time' ? 'size' : 'time' })))}
+        <Text size="footnote" color={C.muted}>Saved for every session. /files settings opens this.</Text>
       </Box>
     )
 
@@ -535,17 +624,25 @@ export const register: Register = on => {
           touched.map(t => {
             const [label, color] = badgeOf(base(t.path))
             const st = STATUS[t.status]
-            const d = rel(root, dirOf(t.path))
+            const d = shortDir(root, dirOf(t.path))
+            // The name keeps its room, the folder gives way first (cut with
+            // "…"), and the pill always stays inside the card.
             return (
-              <Box key={`t:${t.path}`} flexDirection="row" justifyContent="space-between" alignItems="center" paddingLeft={2}>
-                <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1}>
+              <Box key={`t:${t.path}`} flexDirection="row" justifyContent="space-between" alignItems="center" paddingLeft={2} gap={1}>
+                <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1} minWidth={0}>
                   {chip(`b:${t.path}`, label, color, true)}
-                  <Text weight="bold" color={C.fg} wrap="truncate-end">
-                    {base(t.path)}
-                  </Text>
-                  {d && <Text color={C.muted} wrap="truncate-end">{d}</Text>}
+                  <Box flexShrink={0}>
+                    <Text weight="bold" color={C.fg} wrap="truncate-end">
+                      {base(t.path)}
+                    </Text>
+                  </Box>
+                  {d && (
+                    <Box flexShrink={1} minWidth={0}>
+                      <Text color={C.muted} wrap="truncate-start">{d}</Text>
+                    </Box>
+                  )}
                 </Box>
-                {chip(`p:${t.path}`, st.label, st.color)}
+                <Box flexShrink={0}>{chip(`p:${t.path}`, st.label, st.color)}</Box>
               </Box>
             )
           })
@@ -569,7 +666,7 @@ export const register: Register = on => {
         return
       }
       const list = entries
-        .filter(en => view.showHidden || !en.name.startsWith('.'))
+        .filter(en => settings.showHidden || !en.name.startsWith('.'))
         .filter(en => en.name !== '.DS_Store')
         .sort((a, b) => (a.kind === 'dir') === (b.kind === 'dir') ? a.name.localeCompare(b.name) : a.kind === 'dir' ? -1 : 1)
       for (const en of list) {
@@ -639,7 +736,7 @@ export const register: Register = on => {
         } else if (git1 && git1.code === '??') {
           right = <Text weight="bold" color={C.green}>new</Text>
         } else if (!r.isDir) {
-          right = <Text color={C.faint}>{view.showSizes ? fmtSize(r.size) : fmtTime(r.mtime)}</Text>
+          right = <Text color={C.faint}>{settings.column === "size" ? fmtSize(r.size) : fmtTime(r.mtime)}</Text>
         } else {
           right = <Text> </Text>
         }
@@ -658,7 +755,7 @@ export const register: Register = on => {
             paddingLeft={r.depth * 2}
             paddingRight={1}
           >
-            {isLive && Svg && (
+            {isLive && animate && Svg && (
               // Behind the whole row: a band of light sweeps from the name to
               // the pill. Absolute, so it moves nothing; drawn first, so the
               // name and the pill sit on top of it.
@@ -667,7 +764,7 @@ export const register: Register = on => {
               </Box>
             )}
             <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1}>
-              {isLive && Svg ? anim(`d:${r.path}`, liveDot(STATUS[st!].color), 14, 14, "live") : <Text color={C.faint}>{r.isDir ? (isOpen ? "▾" : "▸") : " "}</Text>}
+              {isLive && animate && Svg ? anim(`d:${r.path}`, liveDot(STATUS[st!].color), 14, 14, "live") : <Text color={C.faint}>{r.isDir ? (isOpen ? "▾" : "▸") : " "}</Text>}
               {r.isDir ? (
                 icon(PATHS.folder, under ? C.yellow : isDot ? C.muted : C.blue, 18, '▤')
               ) : (
@@ -693,18 +790,26 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1} paddingX={1} paddingY={1}>
         {nowCard}
-        {search}
-        {buttons}
-        {touchedCard}
-        <Box flexDirection="row" justifyContent="space-between" paddingX={1} marginTop={1}>
-          <Text size="caption" weight="bold" color={C.muted}>{view.query.trim() ? 'SEARCH' : 'ALL FILES'}</Text>
-          <Text size="caption" weight="bold" color={C.muted} wrap="truncate-middle">
-            {base(g.repo && root.startsWith(g.repo) ? g.repo : root).toUpperCase()}
-          </Text>
-        </Box>
-        <Box flexDirection="column" paddingX={1}>
-          {tree}
-        </Box>
+        {view.showSettings ? (
+          settingsCard
+        ) : (
+          <Box flexDirection="column" gap={1}>
+            {search}
+            {touchedCard}
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1} marginTop={1} gap={1}>
+              <Box flexDirection="row" gap={1} flexShrink={1} minWidth={0}>
+                <Text size="caption" weight="bold" color={C.muted}>{view.query.trim() ? 'SEARCH' : 'ALL FILES'}</Text>
+                <Text size="caption" weight="bold" color={C.faint} wrap="truncate-middle">
+                  {base(g.repo && root.startsWith(g.repo) ? g.repo : root).toUpperCase()}
+                </Text>
+              </Box>
+              {headerButtons}
+            </Box>
+            <Box flexDirection="column" paddingX={1}>
+              {tree}
+            </Box>
+          </Box>
+        )}
       </Box>
     )
   })
