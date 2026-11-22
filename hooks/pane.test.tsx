@@ -120,7 +120,11 @@ test('settings change from the pane and are kept for the next session', async ($
 
   await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'settings' })
+  // The pointer comes onto the gear (its hover look) and leaves again.
+  await ui.pointer({ type: 'move', x: 0, y: 0, in: 'hit-settings' })
+  await ui.pointer({ type: 'leave', x: 0, y: 0, in: 'hit-settings' })
+  // A click on the drawn gear icon: its click area hears the pointer.
+  await ui.pointer({ type: 'up', x: 0, y: 0, button: 'left', in: 'hit-settings' })
   expect(await ui.find({ type: 'Text', text: /SETTINGS/ })).toBeTruthy()
   expect((await ui.find({ type: 'Button', key: 's:close' }))?.text).toBe('4 s')
 

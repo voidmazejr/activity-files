@@ -1,7 +1,8 @@
 import { atom, read, update } from 'claude-code'
-import type { ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
+import type { ClientProps, ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
 
 import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View } from '../types'
+import type { HitProps } from "./hit"
 
 const PANE = 'activity-files'
 
@@ -10,8 +11,8 @@ const touchedAtom = atom({ plugin: 'activity-files', key: 'touched' } as const, 
 const gitAtom = atom({ plugin: 'activity-files', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
 const viewAtom = atom(
   { plugin: 'activity-files', key: 'view' } as const,
-  { root: '', expanded: [], query: '', showSettings: false } as View,
-  { shape: 'view-2' },
+  { root: "", expanded: [], query: "", showSettings: false, tick: 0 } as View,
+  { shape: "view-3" },
 )
 
 // PaneSettings live in $.store too, so they carry over to every new session.
@@ -283,10 +284,54 @@ function commitDir(cmd: string, root: string) {
   return abs
 }
 
+// The toolbar's icons: a drawn icon in the desktop app, a symbol elsewhere.
+const TOOLS = [
+  { id: 'refresh', name: 'Refresh', glyph: '↻', path: 'M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5' },
+  { id: 'collapse', name: 'Collapse all folders', glyph: '⊟', path: 'm7 20 5-5 5 5M7 4l5 5 5-5' },
+  { id: 'up', name: 'Up a folder', glyph: '↑', path: `${FOLDER}M12 10v6M9 13l3-3 3 3` },
+  { id: 'home', name: 'Back to the project', glyph: '⌂', path: 'M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1Z' },
+  {
+    id: 'settings',
+    name: 'Settings',
+    glyph: '⚙',
+    path: 'M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2ZM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z',
+  },
+] as const
+
+async function toolAction($: Dollar, id: string) {
+  if (id === 'refresh') {
+    await refreshGit($)
+    await update($, viewAtom, v => ({ ...v, tick: v.tick + 1 }))
+  } else if (id === 'collapse') {
+    await update($, viewAtom, v => ({ ...v, expanded: [] }))
+  } else if (id === 'up') {
+    const cwd = await $.session.cwd()
+    await update($, viewAtom, v => ({ ...v, root: dirOf(v.root || cwd), expanded: [] }))
+    await refreshGit($)
+  } else if (id === 'home') {
+    const cwd = await $.session.cwd()
+    await update($, viewAtom, v => ({ ...v, root: cwd, expanded: [] }))
+    await refreshGit($)
+  } else if (id === 'settings') {
+    await update($, viewAtom, v => ({ ...v, showSettings: !v.showSettings }))
+  }
+}
+
 // The pane opens when Claude starts working and closes on its own a few
 // seconds after Claude finishes (both in the settings). /files opens it by
 // hand, and then it stays.
 let closeTimer: Timer | undefined
+
+// The toolbar icon under the pointer, '' for none. A passing look, so a
+// module variable (a reload just forgets it) and a redraw when it changes.
+let hovered = ''
+const TOOL_PX = 22
+const toolSvg = (d: string, color: string, isHover: boolean) =>
+  svg(
+    TOOL_PX,
+    (isHover ? `<circle cx="11" cy="11" r="11" fill="#ffffff" fill-opacity="0.1"/>` : '') +
+      `<g transform="translate(4 4) scale(${14 / 24})" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></g>`,
+  )
 
 async function openPane($: Dollar) {
   const v = await read($, viewAtom)
@@ -440,10 +485,29 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // A toolbar icon's click area (hit.tsx): a click, or the pointer coming
+  // onto the icon or leaving it.
+  on('ui.message', async ($, e, next) => {
+    if (e.requestId === PANE && e.element.startsWith('hit-')) {
+      const data = (e.data ?? {}) as { press?: unknown; over?: unknown; id?: unknown }
+      if (typeof data.press === 'string') await toolAction($, data.press)
+      else if (typeof data.over === 'boolean' && typeof data.id === 'string') {
+        const nowOver = data.over ? data.id : hovered === data.id ? '' : hovered
+        if (nowOver !== hovered) {
+          hovered = nowOver
+          $.ui.invalidate('ui.render')
+        }
+      }
+      return {}
+    }
+    return next(e)
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button, Input } = els
     const Svg = 'Svg' in els ? (els as { Svg: ElementConstructor<SvgProps> }).Svg : null
+    const Client = "Client" in els ? (els as { Client: ElementConstructor<ClientProps> }).Client : null
 
     const [now, touched, g, view, settings] = await Promise.all([
       read($, nowAtom),
@@ -549,17 +613,38 @@ export const register: Register = on => {
       </Box>
     )
 
-    // Two small icon buttons in the "All files" header: collapse and settings.
-    // A button's label is text, so each icon is one symbol.
-    const iconBtn = (key: string, glyph: string, onPress: () => void, isOn = false) => (
-      <Button key={key} plain onPress={onPress}>
-        <Text color={isOn ? C.fg : C.muted} weight="bold">{glyph}</Text>
-      </Button>
-    )
-    const headerButtons = (
-      <Box flexDirection="row" gap={1} alignItems="center">
-        {iconBtn('collapse', '⊟', setView(v => ({ ...v, expanded: [] })))}
-        {iconBtn('settings', '⚙', setView(v => ({ ...v, showSettings: !v.showSettings })), view.showSettings)}
+    // The toolbar icons (the gear on the top row, the rest beside "All
+    // files"). In the desktop app each icon is a drawing with an invisible
+    // click area over it (hit.tsx), since a Button's face can only be text;
+    // the terminal, which draws no pictures, gets a one-symbol button.
+    const toolIcon = (t: (typeof TOOLS)[number]) => {
+      const isOn = t.id === 'settings' && view.showSettings
+      const isHover = hovered === t.id
+      const color = isOn || isHover ? C.fg : C.muted
+      return Svg && Client ? (
+        // A small bare icon. Under the pointer it turns white and a soft
+        // round glow shows behind it, drawn inside its own square so
+        // nothing around it moves.
+        <Box key={`tool-${t.id}`} position="relative" flexShrink={0}>
+          <Svg key={`tool-svg-${t.id}-${isHover ? 'on' : 'off'}`} source={toolSvg(t.path, color, isHover)} alt={t.name} width={TOOL_PX} height={TOOL_PX} />
+          <Box position="absolute" top={0} left={0} right={0} bottom={0}>
+            <Client key={`hit-${t.id}`} module="./hit.tsx" props={{ id: t.id } satisfies HitProps} width="100%" height="100%" />
+          </Box>
+        </Box>
+      ) : (
+        <Button key={`tool-${t.id}`} plain onPress={() => void toolAction($, t.id)}>
+          <Text color={color} weight="bold">{t.glyph}</Text>
+        </Button>
+      )
+    }
+    const settingsIcon = TOOLS.filter(t => t.id === 'settings').map(toolIcon)
+    const treeIcons = TOOLS.filter(t => t.id !== 'settings').map(toolIcon)
+
+    // The top row: the mod's name, and the gear.
+    const topRow = (
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1}>
+        <Text size="caption" weight="bold" color={C.muted}>ACTIVITY FILES</Text>
+        {settingsIcon}
       </Box>
     )
 
@@ -789,13 +874,14 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1} paddingX={1} paddingY={1}>
+        {topRow}
         {nowCard}
         {view.showSettings ? (
           settingsCard
         ) : (
           <Box flexDirection="column" gap={1}>
-            {search}
             {touchedCard}
+            {search}
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1} marginTop={1} gap={1}>
               <Box flexDirection="row" gap={1} flexShrink={1} minWidth={0}>
                 <Text size="caption" weight="bold" color={C.muted}>{view.query.trim() ? 'SEARCH' : 'ALL FILES'}</Text>
@@ -803,7 +889,9 @@ export const register: Register = on => {
                   {base(g.repo && root.startsWith(g.repo) ? g.repo : root).toUpperCase()}
                 </Text>
               </Box>
-              {headerButtons}
+              <Box flexDirection="row" alignItems="center" gap={1} flexShrink={0}>
+                {treeIcons}
+              </Box>
             </Box>
             <Box flexDirection="column" paddingX={1}>
               {tree}

@@ -28,6 +28,8 @@ export type View = {
   expanded: string[]
   query: string
   showSettings: boolean
+  /** bumped by the refresh button to redraw the tree */
+  tick: number
 }
 
 export type PaneSettings = {
