@@ -1,4 +1,4 @@
-# activity-files
+# Activity Monitor
 
 A Claude Code mod that adds a **Files** pane beside the chat showing what Claude is doing, as it does it:
 
@@ -25,15 +25,15 @@ Press the gear icon at the top of the pane (again to go back), or run `/files se
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install activity-files --marketplace voidmazejr/activity-files
+/plugin install activity-monitor --marketplace voidmazejr/activity-monitor
 ```
 
 Or from a shell:
 
 ```bash
-claude plugin install activity-files --marketplace voidmazejr/activity-files
+claude plugin install activity-monitor --marketplace voidmazejr/activity-monitor
 ```
 
 Answer `y` to add the marketplace, then press Enter for the user scope.
 
-In the Claude desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `voidmazejr/activity-files`, then **Add plugin**.
+In the Claude desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `voidmazejr/activity-monitor`, then **Add plugin**.

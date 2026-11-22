@@ -4,13 +4,13 @@ import type { ClientProps, ElementConstructor, EngineInterface, Register, Render
 import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View } from '../types'
 import type { HitProps } from "./hit"
 
-const PANE = 'activity-files'
+const PANE = 'activity-monitor'
 
-const nowAtom = atom({ plugin: 'activity-files', key: 'now' } as const, { kind: 'idle', title: 'Waiting for a task', sub: 'no files touched yet' } as Now, { shape: 'now-1' })
-const touchedAtom = atom({ plugin: 'activity-files', key: 'touched' } as const, [] as Touched[], { shape: 'touched-1' })
-const gitAtom = atom({ plugin: 'activity-files', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
+const nowAtom = atom({ plugin: 'activity-monitor', key: 'now' } as const, { kind: 'idle', title: 'Waiting for a task', sub: 'no files touched yet' } as Now, { shape: 'now-1' })
+const touchedAtom = atom({ plugin: 'activity-monitor', key: 'touched' } as const, [] as Touched[], { shape: 'touched-1' })
+const gitAtom = atom({ plugin: 'activity-monitor', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
 const viewAtom = atom(
-  { plugin: 'activity-files', key: 'view' } as const,
+  { plugin: 'activity-monitor', key: 'view' } as const,
   { root: "", expanded: [], query: "", showSettings: false, tick: 0 } as View,
   { shape: "view-3" },
 )
@@ -25,7 +25,7 @@ const DEFAULT_SETTINGS: PaneSettings = {
   resetEachTask: true,
 }
 const STORE_KEY = 'settings'
-const settingsAtom = atom({ plugin: 'activity-files', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-1' })
+const settingsAtom = atom({ plugin: 'activity-monitor', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-1' })
 const CLOSE_STEPS = [2, 4, 8, 15, 0]
 
 // ---------- colours (picked to match the video) ----------
@@ -643,7 +643,7 @@ export const register: Register = on => {
     // The top row: the mod's name, and the gear.
     const topRow = (
       <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1}>
-        <Text size="caption" weight="bold" color={C.muted}>ACTIVITY FILES</Text>
+        <Text size="caption" weight="bold" color={C.muted}>ACTIVITY MONITOR</Text>
         {settingsIcon}
       </Box>
     )

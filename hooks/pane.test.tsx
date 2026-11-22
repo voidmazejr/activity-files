@@ -1,9 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 const PANE = {
-  plugin: 'activity-files',
+  plugin: 'activity-monitor',
   component: 'Pane',
-  requestId: 'activity-files',
+  requestId: 'activity-monitor',
   props: {
     title: 'Files: weather-app',
     isFocused: false,

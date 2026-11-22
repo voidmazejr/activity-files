@@ -48,7 +48,7 @@ export type PaneSettings = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'activity-files': {
+    'activity-monitor': {
       now: Shaped<Now>
       touched: Shaped<Touched[]>
       git: Shaped<GitInfo>

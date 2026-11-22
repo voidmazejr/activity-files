@@ -1,5 +1,5 @@
 {
-  "name": "activity-files",
+  "name": "activity-monitor",
   "owner": { "name": "voidmazejr" },
-  "plugins": [{ "name": "activity-files", "source": "./" }]
+  "plugins": [{ "name": "activity-monitor", "source": "./" }]
 }
