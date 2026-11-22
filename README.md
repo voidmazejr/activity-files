@@ -22,8 +22,6 @@ Press ⚙ in the pane, or run `/files settings`. Settings are saved and apply to
 
 ## Install
 
-The repository is private, so you need access to it on GitHub, and your computer needs GitHub set up for git (an SSH key, or `gh auth login` and then `gh auth setup-git`).
-
 At the prompt of a Claude Code terminal session:
 
 ```
