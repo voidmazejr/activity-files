@@ -69,7 +69,7 @@ test('the pane follows a read and an edit, on every surface', async ($, on) => {
   }
 })
 
-test('the pane opens with a turn and closes a few seconds after it', async ($, on) => {
+test('by default the pane opens with the session and never closes by itself', async ($, on) => {
   mock.store(on)
   const clock = mock.clock(on)
   const events: string[] = []
@@ -90,17 +90,45 @@ test('the pane opens with a turn and closes a few seconds after it', async ($, o
   on('turn.complete', () => ({ text: '' }))
 
   await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
-  expect(events).toEqual([])
-
-  await $.turn.start({ text: 'go' } as never)
   await clock.advance(0)
   expect(events).toEqual(['open'])
 
+  await $.turn.start({ text: 'go' } as never)
+  await $.turn.complete({ reason: 'end_turn', turnId: 't1' } as never)
+  await clock.advance(120_000)
+  expect(events).not.toContain('close')
+})
+
+test('with a close delay set, the pane closes that long after Claude finishes', async ($, on) => {
+  mock.store(on, { 'settings-2': { closeAfter: 4 } })
+  const clock = mock.clock(on)
+  const events: string[] = []
+  on('command.register', () => ({ value: { command: 'files' } }))
+  on('ui.open', () => {
+    events.push('open')
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => {
+    events.push('close')
+    return { value: undefined }
+  })
+  on('session.cwd', () => ({ value: '/w' }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('turn.start', () => ({ turnId: 't1' }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'go' } as never)
+  await clock.advance(0)
+  expect(events).not.toContain('close')
+
   await $.turn.complete({ reason: 'end_turn', turnId: 't1' } as never)
   await clock.advance(3000)
-  expect(events).toEqual(['open'])
+  expect(events).not.toContain('close')
   await clock.advance(1500)
-  expect(events).toEqual(['open', 'close'])
+  expect(events[events.length - 1]).toBe('close')
 })
 
 test('settings change from the pane and are kept for the next session', async ($, on) => {
@@ -126,13 +154,12 @@ test('settings change from the pane and are kept for the next session', async ($
   // A click on the drawn gear icon: its click area hears the pointer.
   await ui.pointer({ type: 'up', x: 0, y: 0, button: 'left', in: 'hit-settings' })
   expect(await ui.find({ type: 'Text', text: /SETTINGS/ })).toBeTruthy()
-  expect((await ui.find({ type: 'Button', key: 's:close' }))?.text).toBe('4 s')
-
-  await ui.press({ key: 's:close' })
-  expect((await ui.find({ type: 'Button', key: 's:close' }))?.text).toBe('8 s')
+  // The auto-close dropdown starts at Never; pick 8 seconds from it.
+  expect(await ui.find({ type: 'Select', key: 's:close' })).toBeTruthy()
+  await ui.select({ key: 's:close', value: '8' })
   await ui.press({ key: 's:anim' })
   expect((await ui.find({ type: 'Button', key: 's:anim' }))?.text).toBe('Off')
-  expect(stored.settings).toEqual(expect.objectContaining({ closeAfter: 8, animations: false }))
+  expect(stored['settings-2']).toEqual(expect.objectContaining({ closeAfter: 8, animations: false }))
   await ui.unmount()
 })
 

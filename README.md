@@ -8,18 +8,18 @@ A Claude Code mod that adds a **Files** pane beside the chat showing what Claude
 - **All files**: a git-aware file tree. Changed folders and files are highlighted, and the file Claude is working on gets a small pulsing dot and a light that sweeps across its row.
 - A search box; small icons beside "All files" to refresh, collapse every folder, go up a folder and go back to the project; and a gear at the top for the settings.
 
-The pane opens when Claude starts working and closes a few seconds after it finishes. `/files` opens it by hand.
+The pane opens when a session starts and stays open (it reopens when Claude starts working if you closed it). You can set it to close a few seconds after Claude finishes. `/files` opens it by hand.
 
 ## Settings
 
 Press the gear icon at the top of the pane (again to go back), or run `/files settings`. Settings are saved and apply to every session:
 
-- **Open when Claude starts**: on or off.
-- **Close after Claude finishes**: 2, 4, 8 or 15 seconds, or never.
+- **Open automatically**: open with each session and when Claude starts working. On by default.
+- **Close after Claude finishes**: a dropdown: never (the default), or after 2, 4, 8, 15 or 30 seconds.
 - **Animations**: the pulsing dot, the light sweeping across the active row and the breathing status icon.
 - **Clear the touched list each task**: start "Claude touched" empty for every new request.
 - **Hidden files**: show or hide files and folders starting with a dot.
-- **Right column**: show each file's last-modified time or its size.
+- **Right column**: a dropdown: each file's last-modified time or its size.
 
 ## Install
 

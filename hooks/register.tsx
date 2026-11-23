@@ -41,17 +41,22 @@ const viewAtom = atom(
 )
 
 // PaneSettings live in $.store too, so they carry over to every new session.
+// By default the pane is always there: it opens with the session and when
+// Claude starts working, and never closes on its own.
 const DEFAULT_SETTINGS: PaneSettings = {
   autoOpen: true,
-  closeAfter: 4,
+  closeAfter: 0,
   animations: true,
   showHidden: true,
   column: 'time',
   resetEachTask: true,
 }
-const STORE_KEY = 'settings'
+// 'settings-2': the auto-close default changed to never, so a value saved
+// under the old key keeps everything but its auto-close.
+const STORE_KEY = 'settings-2'
+const OLD_STORE_KEY = 'settings'
 const settingsAtom = atom({ plugin: 'activity-monitor', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-1' })
-const CLOSE_STEPS = [2, 4, 8, 15, 0]
+const CLOSE_CHOICES = [0, 2, 4, 8, 15, 30]
 
 // ---------- colours (picked to match the video) ----------
 const C = {
@@ -402,9 +407,17 @@ export const register: Register = on => {
     })
     const cwd = await $.session.cwd()
     await update($, viewAtom, v => ({ ...v, root: v.root || cwd }))
-    const saved = (await $.store.get(STORE_KEY)) as Partial<PaneSettings> | undefined
-    await update($, settingsAtom, () => ({ ...DEFAULT_SETTINGS, ...(saved ?? {}) }))
+    let saved = (await $.store.get(STORE_KEY)) as Partial<PaneSettings> | undefined
+    if (!saved) {
+      const old = (await $.store.get(OLD_STORE_KEY)) as Partial<PaneSettings> | undefined
+      if (old) {
+        const { closeAfter: _oldClose, ...rest } = old
+        saved = rest
+      }
+    }
+    const s = await update($, settingsAtom, () => ({ ...DEFAULT_SETTINGS, ...(saved ?? {}) }))
     void refreshGit($)
+    if (s.autoOpen) void openPane($)
     return next(e)
   })
 
@@ -576,7 +589,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
-    const { Box, Text, Button, Input } = els
+    const { Box, Text, Button, Input, Select } = els
     // The terminal draws no pictures: there every drawn icon, pill and
     // animation has a text twin (a coloured symbol, a tinted chip).
     const isGui = e.surface !== 'terminal'
@@ -743,6 +756,15 @@ export const register: Register = on => {
         <Button key={`s:${key}`} onPress={onPress}>{value}</Button>
       </Box>
     )
+    // A setting with several values is a dropdown.
+    const settingSelect = (key: string, label: string, value: string, options: { value: string; label: string }[], onSelect: (v: string) => void) => (
+      <Box key={`sr:${key}`} flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
+        <Box flexDirection="column" flexShrink={1} minWidth={0}>
+          <Text color={C.fg}>{label}</Text>
+        </Box>
+        <Select key={`s:${key}`} options={options} value={value} onSelect={onSelect} />
+      </Box>
+    )
     const settingsCard = (
       <Box key="settings" flexDirection="column" borderStyle="round" borderColor={K.border} backgroundColor={K.card} paddingX={2} paddingY={K.padY} gap={K.gap}>
         <Box flexDirection="row" justifyContent="space-between" alignItems="center">
@@ -751,17 +773,27 @@ export const register: Register = on => {
             <Text color={C.muted} weight="bold">Done</Text>
           </Button>
         </Box>
-        {settingRow('open', 'Open when Claude starts', onOff(settings.autoOpen), set(s => ({ ...s, autoOpen: !s.autoOpen })))}
-        {settingRow(
+        {settingRow('open', 'Open automatically', onOff(settings.autoOpen), set(s => ({ ...s, autoOpen: !s.autoOpen })))}
+        {settingSelect(
           'close',
           'Close after Claude finishes',
-          settings.closeAfter ? `${settings.closeAfter} s` : 'Never',
-          set(s => ({ ...s, closeAfter: CLOSE_STEPS[(CLOSE_STEPS.indexOf(s.closeAfter) + 1) % CLOSE_STEPS.length] ?? 4 })),
+          String(settings.closeAfter),
+          CLOSE_CHOICES.map(n => ({ value: String(n), label: n ? `After ${n} seconds` : 'Never' })),
+          v => void saveSettings($, s => ({ ...s, closeAfter: Number(v) || 0 })),
         )}
         {settingRow('anim', 'Animations', onOff(settings.animations), set(s => ({ ...s, animations: !s.animations })))}
         {settingRow('reset', 'Clear the touched list each task', onOff(settings.resetEachTask), set(s => ({ ...s, resetEachTask: !s.resetEachTask })))}
         {settingRow('hidden', 'Hidden files', settings.showHidden ? 'Shown' : 'Hidden', set(s => ({ ...s, showHidden: !s.showHidden })))}
-        {settingRow('column', 'Right column', settings.column === 'time' ? 'Time' : 'Size', set(s => ({ ...s, column: s.column === 'time' ? 'size' : 'time' })))}
+        {settingSelect(
+          'column',
+          'Right column',
+          settings.column,
+          [
+            { value: 'time', label: 'Last modified' },
+            { value: 'size', label: 'Size' },
+          ],
+          v => void saveSettings($, s => ({ ...s, column: v === 'size' ? 'size' : 'time' })),
+        )}
         <Text size="footnote" color={C.muted}>Saved for every session. /files settings opens this.</Text>
       </Box>
     )
