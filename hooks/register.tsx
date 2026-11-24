@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { ClientProps, ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
 
-import type { GitFile, GitInfo, Now, PaneSettings, Touched, TouchStatus, View, WebVisit } from '../types'
+import type { GitFile, GitInfo, Now, PaneSettings, Tokens, Touched, TouchStatus, View, WebVisit } from '../types'
 import type { HitProps } from "./hit"
 
 const PANE = 'activity-monitor'
@@ -33,6 +33,53 @@ async function setWeb($: Dollar, visit: Omit<WebVisit, 'isLive'>, isLive: boolea
   })
 }
 
+// ----- tokens -----
+// Each model step reports what it cost. A step's output is what Claude wrote
+// to ask for its tools (an edit's new text, a command), so it goes to the
+// things those tools work on; the next step's new input is mostly those
+// tools' results coming back (a file's text, a page), so it goes to them too.
+// The first step's new input is your message and the context; a step that
+// asks for no tool is Claude thinking and replying. Cache reads (the whole
+// conversation served again each step) are counted apart, not per thing.
+const EMPTY_TOKENS: Tokens = { input: 0, output: 0, cached: 0, by: {} }
+const tokensAtom = atom({ plugin: 'activity-monitor', key: 'tokens' } as const, { ...EMPTY_TOKENS } as Tokens, { shape: 'tokens-1' })
+
+const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+function thingOf(tool: string, input: unknown): string {
+  const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
+  const visit = webOf(tool, args)
+  if (visit) return `web:${visit.kind}:${visit.target}`
+  if (READ_TOOLS.has(tool) || WRITE_TOOLS.has(tool)) {
+    for (const k of ['file_path', 'notebook_path', 'path']) {
+      const v = args[k]
+      if (typeof v === 'string' && v.startsWith('/')) return tool === 'Read' || WRITE_TOOLS.has(tool) || tool === 'NotebookRead' ? `file:${v}` : 'other'
+    }
+  }
+  if (tool === 'Bash') return 'cmd'
+  if (tool === 'Agent' || tool === 'Task') return 'agents'
+  return 'other'
+}
+
+// The things the main loop's last step asked tools for, waiting for the next
+// step to bring their results in. A passing value, so a module variable.
+let waiting: { turnId: string; things: string[] } | undefined
+
+async function addTokens($: Dollar, cached: number, input: number, output: number, shares: [string[], number][]) {
+  await update($, tokensAtom, t => {
+    const by = { ...t.by }
+    for (const [things, n] of shares) {
+      if (!things.length || n <= 0) continue
+      const each = n / things.length
+      for (const k of things) by[k] = (by[k] ?? 0) + each
+    }
+    return { input: t.input + input, output: t.output + output, cached: t.cached + cached, by }
+  })
+}
+
+const fmtTok = (n: number) =>
+  n < 1000 ? String(Math.round(n)) : n < 10_000 ? `${(n / 1000).toFixed(1)}k` : n < 1_000_000 ? `${Math.round(n / 1000)}k` : `${(n / 1_000_000).toFixed(1)}M`
+
 const gitAtom = atom({ plugin: 'activity-monitor', key: 'git' } as const, { repo: '', branch: '', ahead: 0, behind: 0, files: {} } as GitInfo, { shape: 'git-1' })
 const viewAtom = atom(
   { plugin: 'activity-monitor', key: 'view' } as const,
@@ -50,12 +97,13 @@ const DEFAULT_SETTINGS: PaneSettings = {
   showHidden: true,
   column: 'time',
   resetEachTask: true,
+  showTokens: true,
 }
 // 'settings-2': the auto-close default changed to never, so a value saved
 // under the old key keeps everything but its auto-close.
 const STORE_KEY = 'settings-2'
 const OLD_STORE_KEY = 'settings'
-const settingsAtom = atom({ plugin: 'activity-monitor', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-1' })
+const settingsAtom = atom({ plugin: 'activity-monitor', key: 'settings' } as const, { ...DEFAULT_SETTINGS } as PaneSettings, { shape: 'settings-2' })
 const CLOSE_CHOICES = [0, 2, 4, 8, 15, 30]
 
 // ---------- colours (picked to match the video) ----------
@@ -438,7 +486,9 @@ export const register: Register = on => {
     if (s.resetEachTask) {
       await update($, touchedAtom, () => [])
       await update($, webAtom, () => [])
+      await update($, tokensAtom, () => ({ ...EMPTY_TOKENS, by: {} }))
     }
+    waiting = undefined
     await update($, nowAtom, () => ({ kind: 'thinking', title: 'Claude is thinking', sub: 'no files touched yet' }))
     return next(e)
   })
@@ -541,6 +591,33 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // Each model response: share out what it cost (see "tokens" above).
+  on('turn.step', async function* ($, e, next) {
+    const r = yield* next(e)
+    try {
+      const u = r.usage
+      if (u) {
+        const fresh = u.input_tokens + u.cache_creation_input_tokens
+        const out = u.output_tokens
+        if (e.agentId) {
+          // A subagent's steps all count toward "Subagents".
+          await addTokens($, u.cache_read_input_tokens, fresh, out, [[['agents'], fresh + out]])
+        } else {
+          const asked = r.toolUses.map(t => thingOf(t.name, t.input))
+          const before = waiting && waiting.turnId === e.turnId ? waiting.things : ['prompt']
+          await addTokens($, u.cache_read_input_tokens, fresh, out, [
+            [before, fresh],
+            [asked.length ? asked : ['think'], out],
+          ])
+          waiting = { turnId: e.turnId, things: asked.length ? asked : ['think'] }
+        }
+      }
+    } catch {
+      // counting never gets in the way of the turn
+    }
+    return r
+  })
+
   on('turn.complete', async ($, e, next) => {
     const touched = await read($, touchedAtom)
     const edited = touched.filter(t => t.status === 'edited').length
@@ -601,14 +678,26 @@ export const register: Register = on => {
       ? { border: C.border, hot: C.borderHot, card: C.card as string | undefined, padY: 1, gap: 1 }
       : { border: '#3c3c3c', hot: '#a0a0a0', card: undefined, padY: 0, gap: 0 }
 
-    const [now, touched, g, view, settings, web] = await Promise.all([
+    const [now, touched, g, view, settings, web, tokens] = await Promise.all([
       read($, nowAtom),
       read($, touchedAtom),
       read($, gitAtom),
       read($, viewAtom),
       read($, settingsAtom),
       read($, webAtom),
+      read($, tokensAtom),
     ])
+    const showTok = settings.showTokens !== false
+    // A thing's token count, small and grey beside its pill; nothing before
+    // Claude's next step has counted it.
+    const tokOf = (key: string, k: string) => {
+      const n = tokens.by[k] ?? 0
+      return showTok && n >= 1 ? (
+        <Box key={key} flexShrink={0}>
+          <Text size="footnote" mono color={C.muted}>{fmtTok(n)}</Text>
+        </Box>
+      ) : null
+    }
     const animate = settings.animations
     const root = view.root || (await $.session.cwd())
     const icon = (d: string, color: string, size: number, glyph: string) =>
@@ -783,7 +872,8 @@ export const register: Register = on => {
         )}
         {settingRow('anim', 'Animations', onOff(settings.animations), set(s => ({ ...s, animations: !s.animations })))}
         {settingRow('reset', 'Clear the touched list each task', onOff(settings.resetEachTask), set(s => ({ ...s, resetEachTask: !s.resetEachTask })))}
-        {settingRow('hidden', 'Hidden files', settings.showHidden ? 'Shown' : 'Hidden', set(s => ({ ...s, showHidden: !s.showHidden })))}
+        {settingRow('tokens', 'Token counts', onOff(showTok), set(s => ({ ...s, showTokens: s.showTokens === false })))}
+        {settingRow('hidden','Hidden files', settings.showHidden ? 'Shown' : 'Hidden', set(s => ({ ...s, showHidden: !s.showHidden })))}
         {settingSelect(
           'column',
           'Right column',
@@ -842,7 +932,10 @@ export const register: Register = on => {
                     </Box>
                   )}
                 </Box>
-                <Box flexShrink={0}>{chip(`p:${t.path}`, st.label, st.color)}</Box>
+                <Box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                  {tokOf(`tk:${t.path}`, `file:${t.path}`)}
+                  {chip(`p:${t.path}`, st.label, st.color)}
+                </Box>
               </Box>
             )
           })
@@ -888,10 +981,70 @@ export const register: Register = on => {
                   </Box>
                 )}
               </Box>
-              <Box flexShrink={0}>{chip(`wp:${v.kind}:${v.target}`, pill, C.teal, false, v.isLive && animate)}</Box>
+              <Box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                {tokOf(`wt:${v.kind}:${v.target}`, `web:${v.kind}:${v.target}`)}
+                {chip(`wp:${v.kind}:${v.target}`, pill, C.teal, false, v.isLive && animate)}
+              </Box>
             </Box>
           )
         })}
+      </Box>
+    )
+
+    // ----- Tokens card: where this task's tokens went -----
+    const sumOf = (prefix: string) => Object.entries(tokens.by).reduce((n, [k, v]) => (k.startsWith(prefix) ? n + v : n), 0)
+    const groups = [
+      { id: 'files', label: 'Files', color: C.orange, n: sumOf('file:') },
+      { id: 'web', label: 'Web', color: C.teal, n: sumOf('web:') },
+      { id: 'cmd', label: 'Commands', color: C.blue, n: tokens.by.cmd ?? 0 },
+      { id: 'agents', label: 'Subagents', color: C.purple, n: tokens.by.agents ?? 0 },
+      { id: 'think', label: 'Thinking & replies', color: '#cfcfcf', n: tokens.by.think ?? 0 },
+      { id: 'prompt', label: 'Your message & context', color: C.muted, n: tokens.by.prompt ?? 0 },
+      { id: 'other', label: 'Other tools', color: C.faint, n: tokens.by.other ?? 0 },
+    ].filter(x => x.n >= 1)
+    const total = tokens.input + tokens.output
+    const BAR_PX = 72
+    const BAR_CH = 8
+    const bar = (id: string, share: number, color: string) =>
+      Svg ? (
+        <Svg
+          key={`tb:${id}`}
+          source={`<svg xmlns="http://www.w3.org/2000/svg" width="${BAR_PX}" height="22" viewBox="0 0 ${BAR_PX} 22"><rect x="0" y="9" width="${BAR_PX}" height="4" rx="2" fill="#ffffff" fill-opacity="0.08"/><rect x="0" y="9" width="${Math.max(3, Math.round(share * BAR_PX))}" height="4" rx="2" fill="${color}"/></svg>`}
+          alt={`${Math.round(share * 100)}%`}
+          width={BAR_PX}
+          height={22}
+        />
+      ) : (
+        <Text key={`tb:${id}`} color={color}>
+          {'━'.repeat(Math.max(1, Math.round(share * BAR_CH)))}
+          <Text color={K.border}>{'━'.repeat(BAR_CH - Math.max(1, Math.round(share * BAR_CH)))}</Text>
+        </Text>
+      )
+    const tokensCard = showTok && total > 0 && (
+      <Box key="tokens" flexDirection="column" borderStyle="round" borderColor={K.border} backgroundColor={K.card} paddingX={2} paddingY={K.padY} gap={K.gap}>
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text size="caption" weight="bold" color={C.muted}>TOKENS</Text>
+          <Text size="caption" weight="bold" color={C.muted}>{fmtTok(total)} THIS TASK</Text>
+        </Box>
+        <Box flexDirection="column">
+          {groups.map(x => (
+            <Box key={`tg:${x.id}`} flexDirection="row" justifyContent="space-between" alignItems="center" paddingLeft={2} gap={1}>
+              <Box flexDirection="row" gap={1} alignItems="center" flexShrink={1} minWidth={0}>
+                <Text color={x.color}>●</Text>
+                <Text color={C.fg} wrap="truncate-end">{x.label}</Text>
+              </Box>
+              <Box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                {bar(x.id, x.n / total, x.color)}
+                <Box width={6} alignItems="flex-end">
+                  <Text mono color={C.fg}>{fmtTok(x.n)}</Text>
+                </Box>
+              </Box>
+            </Box>
+          ))}
+        </Box>
+        <Text size="footnote" color={C.muted} wrap="truncate-end">
+          {fmtTok(tokens.input)} in · {fmtTok(tokens.output)} out{tokens.cached >= 1 ? ` · ${fmtTok(tokens.cached)} reread from cache` : ''}
+        </Text>
       </Box>
     )
 
@@ -1054,6 +1207,7 @@ export const register: Register = on => {
           <Box flexDirection="column" gap={1}>
             {touchedCard}
             {webCard}
+            {tokensCard}
             {search}
             <Box flexDirection="row" justifyContent="space-between" alignItems="center" paddingX={1} marginTop={1} gap={1}>
               <Box flexDirection="row" gap={1} flexShrink={1} minWidth={0}>

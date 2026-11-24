@@ -163,6 +163,56 @@ test('settings change from the pane and are kept for the next session', async ($
   await ui.unmount()
 })
 
+test('tokens are shared out to the files and sites each step worked on', async ($, on) => {
+  mock.store(on)
+  on('command.register', () => ({ value: { command: 'files' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('fs.list', () => ({ value: [] }))
+  on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.call', () => ({ result: {} }))
+  on('turn.start', () => ({ turnId: 't1' }))
+  const usage = (input: number, output: number, cached = 0) => ({
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cached,
+    cache_creation_input_tokens: 0,
+    model: 'm',
+  })
+  // Step 0 reads a file, step 1 searches, step 2 replies.
+  const steps = [
+    { toolUses: [{ name: 'Read', input: { file_path: '/w/src/client.js' } }], usage: usage(3000, 100) },
+    { toolUses: [{ name: 'WebSearch', input: { query: 'retry jitter' } }], usage: usage(1500, 50, 20_000) },
+    { toolUses: [], usage: usage(800, 400, 21_000) },
+  ]
+  on('turn.step', async function* (_, e) {
+    const s = steps[e.index]!
+    return { turnId: e.turnId, index: e.index, answer: '', stopReason: 'end_turn' as const, ...s }
+  })
+
+  await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  for (let i = 0; i < 3; i++) {
+    const it = $.turn.step({ turnId: 't1', index: i, model: 'm', messageCount: 1 } as never) as AsyncIterable<unknown>
+    for await (const _ of it) void _
+  }
+  await $.tool.call({ tool: 'Read', file_path: '/w/src/client.js' })
+  await $.tool.call({ tool: 'WebSearch', query: 'retry jitter', mode: 'standard' })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    // client.js: step 0's output (100) + step 1's new input (1500) = 1.6k
+    expect(await ui.find({ type: 'Text', text: /^1\.6k$/ })).toBeTruthy()
+    // the search: step 1's output (50) + step 2's new input (800) = 850
+    expect(await ui.find({ type: 'Text', text: /^850$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /5\.8k THIS TASK/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Your message & context/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /41k reread from cache/ })).toBeTruthy()
+    await ui.unmount()
+  }
+})
+
 test('web pages and searches show in the status card and the web card', async ($, on) => {
   mock.store(on)
   on('command.register', () => ({ value: { command: 'files' } }))
@@ -182,7 +232,7 @@ test('web pages and searches show in the status card and the web card', async ($
   })
 
   await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'WebSearch', query: 'claude code mods' })
+  await $.tool.call({ tool: 'WebSearch', query: 'claude code mods', mode: 'standard' })
   await $.tool.call({ tool: 'WebFetch', url: 'https://www.example.com/docs/page', prompt: 'read it' })
   expect(during).toEqual(['Claude is reading example.com'])
 

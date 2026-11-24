@@ -23,6 +23,19 @@ export type WebVisit = {
   isLive: boolean
 }
 
+/**
+ * Tokens this task, as the API counted them. `by` maps a thing to its new
+ * tokens (uncached input + cache writes + output): `file:<path>`,
+ * `web:<kind>:<target>`, or a group: `cmd`, `agents`, `think`, `prompt`, `other`.
+ */
+export type Tokens = {
+  input: number
+  output: number
+  /** input the prompt cache served again: cheap, so kept apart */
+  cached: number
+  by: Record<string, number>
+}
+
 export type GitFile ={ code: string; add: number; del: number }
 
 export type GitInfo = {
@@ -54,6 +67,8 @@ export type PaneSettings = {
   column: 'time' | 'size'
   /** start "Claude touched" empty on each new task */
   resetEachTask: boolean
+  /** token counts on each file, site and in the Tokens card */
+  showTokens: boolean
 }
 
 declare module 'claude-code' {
@@ -62,6 +77,7 @@ declare module 'claude-code' {
       now: Shaped<Now>
       touched: Shaped<Touched[]>
       web: Shaped<WebVisit[]>
+      tokens: Shaped<Tokens>
       git: Shaped<GitInfo>
       view: Shaped<View>
       settings: Shaped<PaneSettings>
