@@ -126,7 +126,10 @@ const gitAtom = atom({ plugin: 'activity-monitor', key: 'git' } as const, { repo
 const viewAtom = atom(
   { plugin: 'activity-monitor', key: 'view' } as const,
   { root: "", expanded: [], query: "", showSettings: false, tick: 0 } as View,
-  { shape: "view-3" },
+  // 'view-4': `root` is now '' unless the person navigated with ↑; a value
+  // stored by older code pinned the folder the session started in (for a
+  // desktop session, a temporary spare folder), so it starts over.
+  { shape: "view-4" },
 )
 
 // PaneSettings live in $.store too, so they carry over to every new session.
@@ -335,9 +338,24 @@ async function git($: Dollar, cwd: string, args: string[]) {
   }
 }
 
+// The project's root folder, read fresh each time: a session can start in one
+// folder and move (the desktop app starts sessions in a spare folder, /cd, a
+// worktree), so it is never pinned at startup.
+async function projectRoot($: Dollar) {
+  try {
+    return (await $.session.root()) || (await $.session.cwd())
+  } catch {
+    return $.session.cwd()
+  }
+}
+
+// The folder the tree shows: one the person moved to with ↑, else the project.
+async function treeRoot($: Dollar, view?: View) {
+  return (view ?? (await read($, viewAtom))).root || (await projectRoot($))
+}
+
 async function refreshGit($: Dollar) {
-  const view = await read($, viewAtom)
-  const root = view.root || (await $.session.cwd())
+  const root = await treeRoot($)
   const top = (await git($, root, ['rev-parse', '--show-toplevel']))?.trim()
   if (!top) {
     await update($, gitAtom, () => ({ repo: '', branch: '', ahead: 0, behind: 0, files: {} }))
@@ -402,8 +420,8 @@ async function setTouched($: Dollar, path: string, status: TouchStatus) {
 
 async function reveal($: Dollar, path: string) {
   const view = await read($, viewAtom)
-  const root = view.root
-  if (!root || !path.startsWith(root + '/')) return
+  const root = await treeRoot($, view)
+  if (!path.startsWith(root + '/')) return
   const add = ancestors(root, path).filter(d => !view.expanded.includes(d))
   if (add.length) await update($, viewAtom, v => ({ ...v, expanded: [...v.expanded, ...add] }))
 }
@@ -454,12 +472,12 @@ async function toolAction($: Dollar, id: string) {
   } else if (id === 'collapse') {
     await update($, viewAtom, v => ({ ...v, expanded: [] }))
   } else if (id === 'up') {
-    const cwd = await $.session.cwd()
-    await update($, viewAtom, v => ({ ...v, root: dirOf(v.root || cwd), expanded: [] }))
+    const project = await projectRoot($)
+    await update($, viewAtom, v => ({ ...v, root: dirOf(v.root || project), expanded: [] }))
     await refreshGit($)
   } else if (id === 'home') {
-    const cwd = await $.session.cwd()
-    await update($, viewAtom, v => ({ ...v, root: cwd, expanded: [] }))
+    // back to following the project root, wherever the session is now
+    await update($, viewAtom, v => ({ ...v, root: '', expanded: [] }))
     await refreshGit($)
   } else if (id === 'settings') {
     await update($, viewAtom, v => ({ ...v, showSettings: !v.showSettings }))
@@ -474,6 +492,11 @@ let closeTimer: Timer | undefined
 // The toolbar icon under the pointer, '' for none. A passing look, so a
 // module variable (a reload just forgets it) and a redraw when it changes.
 let hovered = ''
+
+// When the current task began (ms), to mark files written since then that git
+// cannot speak for. A module variable: a reload forgets it, and then only git
+// and Claude's own edits mark files until the next task.
+let taskStart = 0
 const TOOL_PX = 22
 const toolSvg = (d: string, color: string, isHover: boolean) =>
   svg(
@@ -483,8 +506,7 @@ const toolSvg = (d: string, color: string, isHover: boolean) =>
   )
 
 async function openPane($: Dollar) {
-  const v = await read($, viewAtom)
-  const root = v.root || (await $.session.cwd())
+  const root = await treeRoot($)
   await $.ui.open({ id: PANE, title: `Files: ${base(root)}`, backgroundColor: "transparent" })
 }
 
@@ -495,8 +517,6 @@ export const register: Register = on => {
       description: 'Open the activity file pane; /files settings opens its settings',
       argumentHint: '[settings]',
     })
-    const cwd = await $.session.cwd()
-    await update($, viewAtom, v => ({ ...v, root: v.root || cwd }))
     let saved = (await $.store.get(STORE_KEY)) as Partial<PaneSettings> | undefined
     if (!saved) {
       const old = (await $.store.get(OLD_STORE_KEY)) as Partial<PaneSettings> | undefined
@@ -524,8 +544,10 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     closeTimer?.cancel()
     closeTimer = undefined
+    if (!e.agentId) taskStart = await $.clock.now().catch(() => 0)
     const s = await read($, settingsAtom)
     if (s.autoOpen) void openPane($)
+    void refreshGit($)
     const m = await refreshMeter($)
     const start = { usd: m.usd }
     if (s.resetEachTask) {
@@ -545,8 +567,7 @@ export const register: Register = on => {
     const input = e as unknown as Record<string, unknown>
     const tool = String(e.tool)
     const path = pathOf(input)
-    const view = await read($, viewAtom)
-    const root = view.root
+    const root = await treeRoot($)
     const where = (p: string) => {
       const d = shortDir(root, dirOf(p))
       return d ? `in ${d}` : `in ${base(root)}`
@@ -606,6 +627,8 @@ export const register: Register = on => {
       const before = isCommit ? (await git($, dir, ['rev-parse', 'HEAD']))?.trim() : undefined
       const ran = await next(e)
       await refreshGit($)
+      // the command may have written files: redraw the tree so it lists them
+      await update($, viewAtom, v => ({ ...v, tick: v.tick + 1 }))
       if (isCommit) {
         const after = (await git($, dir, ['rev-parse', 'HEAD']))?.trim()
         const top = (await git($, dir, ['rev-parse', '--show-toplevel']))?.trim() ?? dir
@@ -760,7 +783,7 @@ export const register: Register = on => {
       ) : null
     }
     const animate = settings.animations
-    const root = view.root || (await $.session.cwd())
+    const root = await treeRoot($, view)
     const icon = (d: string, color: string, size: number, glyph: string) =>
       Svg ? <Svg source={lineIcon(d, color, size)} alt={glyph} width={size} height={size} /> : <Text color={color}>{glyph}</Text>
 
@@ -1136,7 +1159,11 @@ export const register: Register = on => {
 
     // ----- tree -----
     const activeStatus = new Map(touched.map(t => [t.path, t.status]))
-    const changedUnder = (dir: string) => changedPaths.filter(p => p.startsWith(dir + '/')).length
+    // Changed in the tree: what git reports, plus what Claude edited or
+    // committed this task, so a folder outside git still shows its changes.
+    const isMade = (s: TouchStatus | undefined) => s === 'edited' || s === 'committed'
+    const markedPaths = [...new Set([...changedPaths, ...touched.filter(t => isMade(t.status)).map(t => t.path)])]
+    const changedUnder = (dir: string) => markedPaths.filter(p => p.startsWith(dir + '/')).length
     type Row = { path: string; name: string; isDir: boolean; depth: number; size: number; mtime: number }
     const rows: Row[] = []
     const MAX = 400
@@ -1193,6 +1220,10 @@ export const register: Register = on => {
         const git1 = g.files[r.path]
         const st = activeStatus.get(r.path)
         const isLive = st === 'editing' || st === 'reading'
+        // Claude's own edit, or a file written since the task began (a shell
+        // command's change outside git), where git says nothing about it
+        const made = !r.isDir && !git1 && !isLive && isMade(st) ? STATUS[st!] : undefined
+        const isRecent = !r.isDir && !git1 && !isLive && !made && taskStart > 0 && r.mtime >= taskStart
         const under = r.isDir ? changedUnder(r.path) : 0
         const isOpen = view.expanded.includes(r.path)
         const isDot = r.name.startsWith('.')
@@ -1200,7 +1231,9 @@ export const register: Register = on => {
           ? STATUS[st!].color
           : git1
             ? git1.code === '??' ? C.green : C.yellow
-            : under
+            : made
+              ? made.color
+            : under || isRecent
               ? C.yellow
               : isDot
                 ? C.muted
@@ -1219,6 +1252,10 @@ export const register: Register = on => {
           )
         } else if (git1 && git1.code === '??') {
           right = <Text weight="bold" color={C.green}>new</Text>
+        } else if (made) {
+          right = <Text weight="bold" color={made.color}>{made.label.toLowerCase()}</Text>
+        } else if (isRecent) {
+          right = <Text weight="bold" color={C.yellow}>changed</Text>
         } else if (!r.isDir) {
           right = <Text color={C.faint}>{settings.column === "size" ? fmtSize(r.size) : fmtTime(r.mtime)}</Text>
         } else {
@@ -1271,7 +1308,7 @@ export const register: Register = on => {
                   <Text color={nameColor} weight={under ? 'bold' : 'regular'}>{r.name}</Text>
                 </Button>
               ) : (
-                <Text color={nameColor} weight={isLive || git1 ? 'bold' : 'regular'} wrap="truncate-end">
+                <Text color={nameColor} weight={isLive || git1 || made || isRecent ? 'bold' : 'regular'} wrap="truncate-end">
                   {r.name}
                 </Text>
               )}

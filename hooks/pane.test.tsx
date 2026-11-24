@@ -262,3 +262,34 @@ test('web pages and searches show in the status card and the web card', async ($
     await ui.unmount()
   }
 })
+
+test('the tree follows the project root after the session moves, and marks edits outside git', async ($, on) => {
+  mock.store(on)
+  // The session starts in a spare folder and moves to the project: cwd and
+  // root answer the spare first, the project once it has moved.
+  let where = '/spare'
+  on('command.register', () => ({ value: { command: 'files' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.cwd', () => ({ value: where }))
+  on('session.root', () => ({ value: where }))
+  on('fs.list', (_, e) => ({
+    value: (FILES[String((e as { path?: string }).path)] ?? []).map(f => ({ ...f, size: 10, mtimeMs: 0, isLink: false })),
+  }))
+  // not a git repository
+  on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('tool.call', () => ({ result: {} }))
+
+  await $.session.start({ cwd: '/spare', surface: 'desktop', isInteractive: true })
+  where = '/w'
+  await $.tool.call({ tool: 'Edit', file_path: '/w/src/client.js', old_string: 'a', new_string: 'b' })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /^README\.md$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^client\.js$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /1 changed/ })).toBeTruthy()
+    await ui.unmount()
+  }
+})
