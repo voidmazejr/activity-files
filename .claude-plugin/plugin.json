@@ -1,6 +1,6 @@
 {
   "name": "activity-monitor",
-  "version":"0.5.0",
+  "version":"0.6.2",
   "description": "A card-style file pane: what Claude is doing right now, the files it touched, and a git-aware file tree",
   "types": "./types/index.d.ts"
 }

@@ -163,7 +163,7 @@ test('settings change from the pane and are kept for the next session', async ($
   await ui.unmount()
 })
 
-test('tokens are shared out to the files and sites each step worked on', async ($, on) => {
+test('tokens are cost-weighted and shared out to what each step worked on', async ($, on) => {
   mock.store(on)
   on('command.register', () => ({ value: { command: 'files' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -173,6 +173,17 @@ test('tokens are shared out to the files and sites each step worked on', async (
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.call', () => ({ result: {} }))
   on('turn.start', () => ({ turnId: 't1' }))
+  // The engine's readings: before the task, then after it.
+  let after = false
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: { tokens: after ? 42_000 : 40_000, window: 1_000_000, percent: 4 },
+      rateLimits: [],
+      cost: { usd: after ? 1.25 : 1 },
+    },
+  }))
+  // 'm' is an unlisted model: cache reads at 0.1x, output at 5x.
   const usage = (input: number, output: number, cached = 0) => ({
     input_tokens: input,
     output_tokens: output,
@@ -184,7 +195,7 @@ test('tokens are shared out to the files and sites each step worked on', async (
   const steps = [
     { toolUses: [{ name: 'Read', input: { file_path: '/w/src/client.js' } }], usage: usage(3000, 100) },
     { toolUses: [{ name: 'WebSearch', input: { query: 'retry jitter' } }], usage: usage(1500, 50, 20_000) },
-    { toolUses: [], usage: usage(800, 400, 21_000) },
+    { toolUses: [], usage: usage(870, 400, 21_000) },
   ]
   on('turn.step', async function* (_, e) {
     const s = steps[e.index]!
@@ -193,6 +204,7 @@ test('tokens are shared out to the files and sites each step worked on', async (
 
   await $.session.start({ cwd: '/w', surface: 'desktop', isInteractive: true })
   await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  after = true
   for (let i = 0; i < 3; i++) {
     const it = $.turn.step({ turnId: 't1', index: i, model: 'm', messageCount: 1 } as never) as AsyncIterable<unknown>
     for await (const _ of it) void _
@@ -202,13 +214,18 @@ test('tokens are shared out to the files and sites each step worked on', async (
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    // client.js: step 0's output (100) + step 1's new input (1500) = 1.6k
-    expect(await ui.find({ type: 'Text', text: /^1\.6k$/ })).toBeTruthy()
-    // the search: step 1's output (50) + step 2's new input (800) = 850
-    expect(await ui.find({ type: 'Text', text: /^850$/ })).toBeTruthy()
-    expect(await ui.find({ type: 'Text', text: /5\.8k THIS TASK/ })).toBeTruthy()
+    // client.js: step 0's output 100 x5 = 500, plus step 1's new input 1500 = 2.0k
+    expect(await ui.find({ type: 'Text', text: /^2\.0k$/ })).toBeTruthy()
+    // the search: step 1's output 50 x5 + its 20k cache read x0.1 = 2250,
+    // plus step 2's new input 870 = 3.1k
+    expect(await ui.find({ type: 'Text', text: /^3\.1k$/ })).toBeTruthy()
+    // all: 3000 + 2000 + 3120 + (400 x5 + 21000 x0.1) = 12.2k
+    expect(await ui.find({ type: 'Text', text: /≈12k THIS TASK/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /≈\$0\.25 at API prices/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Conversation 42k of 1\.0M/ })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /Your message & context/ })).toBeTruthy()
-    expect(await ui.find({ type: 'Text', text: /41k reread from cache/ })).toBeTruthy()
+    // no plan section: people see their limits in the app
+    expect(await ui.find({ type: 'Text', text: /YOUR PLAN|THIS PROMPT|limit/ })).toBeUndefined()
     await ui.unmount()
   }
 })

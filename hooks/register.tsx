@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { ClientProps, ElementConstructor, EngineInterface, Register, RenderChildren, SvgProps, Timer } from "claude-code"
 
-import type { GitFile, GitInfo, Now, PaneSettings, Tokens, Touched, TouchStatus, View, WebVisit } from '../types'
+import type { GitFile, GitInfo, Meter, Now, PaneSettings, Tokens, Touched, TouchStatus, View, WebVisit } from '../types'
 import type { HitProps } from "./hit"
 
 const PANE = 'activity-monitor'
@@ -39,10 +39,38 @@ async function setWeb($: Dollar, visit: Omit<WebVisit, 'isLive'>, isLive: boolea
 // things those tools work on; the next step's new input is mostly those
 // tools' results coming back (a file's text, a page), so it goes to them too.
 // The first step's new input is your message and the context; a step that
-// asks for no tool is Claude thinking and replying. Cache reads (the whole
-// conversation served again each step) are counted apart, not per thing.
-const EMPTY_TOKENS: Tokens = { input: 0, output: 0, cached: 0, by: {} }
-const tokensAtom = atom({ plugin: 'activity-monitor', key: 'tokens' } as const, { ...EMPTY_TOKENS } as Tokens, { shape: 'tokens-1' })
+// asks for no tool is Claude thinking and replying. Rereading the whole
+// conversation from the cache is the cost of making that step, so it goes
+// to what the step asked for.
+//
+// Every count is cost-weighted: what it costs next to one plain input token
+// on the model that answered, from Anthropic's published price ratios.
+// Output costs 5x input on every current model; a cache write 1.25x (kept
+// 5 minutes) or 2x (kept an hour); a cache read 0.025x on Fable / Mythos
+// 5.1 and 5.2, 0.05x on Opus 5.5 and Sonnet 5.5, and 0.1x on the others.
+// So the numbers compare across kinds of token and track a per-token bill.
+const OUT_X = 5
+const WRITE_5M_X = 1.25
+const WRITE_1H_X = 2
+const readX = (model: string) =>
+  /(fable|mythos)-5-[12]\b/.test(model) ? 0.025 : /(opus|sonnet)-5-5\b/.test(model) ? 0.05 : 0.1
+
+const emptyTokens = (): Tokens => ({ input: 0, output: 0, writes: 0, cached: 0, weighted: 0, by: {}, start: {} })
+const tokensAtom = atom({ plugin: 'activity-monitor', key: 'tokens' } as const, emptyTokens(), { shape: 'tokens-4' })
+const meterAtom = atom({ plugin: 'activity-monitor', key: 'meter' } as const, {} as Meter, { shape: 'meter-2' })
+
+// The engine's live readings (the status line's figures; asking is free).
+async function refreshMeter($: Dollar): Promise<Meter> {
+  try {
+    const u = await $.session.usage()
+    const m: Meter = {}
+    if (u.cost) m.usd = u.cost.usd
+    if (u.context.tokens !== undefined) m.context = { tokens: u.context.tokens, window: u.context.window }
+    return await update($, meterAtom, () => m)
+  } catch {
+    return read($, meterAtom)
+  }
+}
 
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
@@ -65,17 +93,31 @@ function thingOf(tool: string, input: unknown): string {
 // step to bring their results in. A passing value, so a module variable.
 let waiting: { turnId: string; things: string[] } | undefined
 
-async function addTokens($: Dollar, cached: number, input: number, output: number, shares: [string[], number][]) {
+type Raw = { input: number; output: number; writes: number; cached: number }
+async function addTokens($: Dollar, raw: Raw, shares: [string[], number][]) {
   await update($, tokensAtom, t => {
     const by = { ...t.by }
+    let weighted = t.weighted
     for (const [things, n] of shares) {
-      if (!things.length || n <= 0) continue
-      const each = n / things.length
-      for (const k of things) by[k] = (by[k] ?? 0) + each
+      if (n <= 0) continue
+      weighted += n
+      const list = things.length ? things : ['other']
+      const each = n / list.length
+      for (const k of list) by[k] = (by[k] ?? 0) + each
     }
-    return { input: t.input + input, output: t.output + output, cached: t.cached + cached, by }
+    return {
+      ...t,
+      input: t.input + raw.input,
+      output: t.output + raw.output,
+      writes: t.writes + raw.writes,
+      cached: t.cached + raw.cached,
+      weighted,
+      by,
+    }
   })
 }
+
+const fmtUsd = (n: number) => (n < 0.01 ? '<$0.01' : n < 10 ? `$${n.toFixed(2)}` : `$${Math.round(n)}`)
 
 const fmtTok = (n: number) =>
   n < 1000 ? String(Math.round(n)) : n < 10_000 ? `${(n / 1000).toFixed(1)}k` : n < 1_000_000 ? `${Math.round(n / 1000)}k` : `${(n / 1_000_000).toFixed(1)}M`
@@ -465,6 +507,7 @@ export const register: Register = on => {
     }
     const s = await update($, settingsAtom, () => ({ ...DEFAULT_SETTINGS, ...(saved ?? {}) }))
     void refreshGit($)
+    void refreshMeter($)
     if (s.autoOpen) void openPane($)
     return next(e)
   })
@@ -483,10 +526,15 @@ export const register: Register = on => {
     closeTimer = undefined
     const s = await read($, settingsAtom)
     if (s.autoOpen) void openPane($)
+    const m = await refreshMeter($)
+    const start = { usd: m.usd }
     if (s.resetEachTask) {
       await update($, touchedAtom, () => [])
       await update($, webAtom, () => [])
-      await update($, tokensAtom, () => ({ ...EMPTY_TOKENS, by: {} }))
+      await update($, tokensAtom, () => ({ ...emptyTokens(), start }))
+    } else {
+      // keep counting, but mark where counting began if it never was
+      await update($, tokensAtom, t => (t.weighted > 0 ? t : { ...t, start }))
     }
     waiting = undefined
     await update($, nowAtom, () => ({ kind: 'thinking', title: 'Claude is thinking', sub: 'no files touched yet' }))
@@ -597,20 +645,31 @@ export const register: Register = on => {
     try {
       const u = r.usage
       if (u) {
-        const fresh = u.input_tokens + u.cache_creation_input_tokens
-        const out = u.output_tokens
+        const raw = {
+          input: u.input_tokens,
+          output: u.output_tokens,
+          writes: u.cache_creation_input_tokens,
+          cached: u.cache_read_input_tokens,
+        }
+        // Cache writes by lifetime when the response says; else 5 minutes.
+        const w1h = u.ephemeral_1h_input_tokens ?? 0
+        const w5m = u.ephemeral_5m_input_tokens ?? raw.writes - w1h
+        const fresh = raw.input + w5m * WRITE_5M_X + w1h * WRITE_1H_X
+        const made = raw.output * OUT_X + raw.cached * readX(u.model || e.model)
         if (e.agentId) {
           // A subagent's steps all count toward "Subagents".
-          await addTokens($, u.cache_read_input_tokens, fresh, out, [[['agents'], fresh + out]])
+          await addTokens($, raw, [[['agents'], fresh + made]])
         } else {
           const asked = r.toolUses.map(t => thingOf(t.name, t.input))
+          const now = asked.length ? asked : ['think']
           const before = waiting && waiting.turnId === e.turnId ? waiting.things : ['prompt']
-          await addTokens($, u.cache_read_input_tokens, fresh, out, [
+          await addTokens($, raw, [
             [before, fresh],
-            [asked.length ? asked : ['think'], out],
+            [now, made],
           ])
-          waiting = { turnId: e.turnId, things: asked.length ? asked : ['think'] }
+          waiting = { turnId: e.turnId, things: now }
         }
+        void refreshMeter($)
       }
     } catch {
       // counting never gets in the way of the turn
@@ -619,6 +678,7 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    void refreshMeter($)
     const touched = await read($, touchedAtom)
     const edited = touched.filter(t => t.status === 'edited').length
     const opened = touched.filter(t => t.status === 'opened').length
@@ -678,7 +738,7 @@ export const register: Register = on => {
       ? { border: C.border, hot: C.borderHot, card: C.card as string | undefined, padY: 1, gap: 1 }
       : { border: '#3c3c3c', hot: '#a0a0a0', card: undefined, padY: 0, gap: 0 }
 
-    const [now, touched, g, view, settings, web, tokens] = await Promise.all([
+    const [now, touched, g, view, settings, web, tokens, meter] = await Promise.all([
       read($, nowAtom),
       read($, touchedAtom),
       read($, gitAtom),
@@ -686,6 +746,7 @@ export const register: Register = on => {
       read($, settingsAtom),
       read($, webAtom),
       read($, tokensAtom),
+      read($, meterAtom),
     ])
     const showTok = settings.showTokens !== false
     // A thing's token count, small and grey beside its pill; nothing before
@@ -1002,7 +1063,7 @@ export const register: Register = on => {
       { id: 'prompt', label: 'Your message & context', color: C.muted, n: tokens.by.prompt ?? 0 },
       { id: 'other', label: 'Other tools', color: C.faint, n: tokens.by.other ?? 0 },
     ].filter(x => x.n >= 1)
-    const total = tokens.input + tokens.output
+    const total = tokens.weighted
     const BAR_PX = 72
     const BAR_CH = 8
     const bar = (id: string, share: number, color: string) =>
@@ -1020,11 +1081,25 @@ export const register: Register = on => {
           <Text color={K.border}>{'━'.repeat(BAR_CH - Math.max(1, Math.round(share * BAR_CH)))}</Text>
         </Text>
       )
+    // What this task cost by the engine's own estimate (as /cost totals it),
+    // read at the start and now.
+    const spentUsd = meter.usd !== undefined && tokens.start.usd !== undefined ? meter.usd - tokens.start.usd : undefined
     const tokensCard = showTok && total > 0 && (
       <Box key="tokens" flexDirection="column" borderStyle="round" borderColor={K.border} backgroundColor={K.card} paddingX={2} paddingY={K.padY} gap={K.gap}>
-        <Box flexDirection="row" justifyContent="space-between">
-          <Text size="caption" weight="bold" color={C.muted}>TOKENS</Text>
-          <Text size="caption" weight="bold" color={C.muted}>{fmtTok(total)} THIS TASK</Text>
+        <Box flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between">
+            <Text size="caption" weight="bold" color={C.muted}>TOKENS</Text>
+            <Text size="caption" weight="bold" color={C.muted}>≈{fmtTok(total)} THIS TASK</Text>
+          </Box>
+          {/* What the heuristic means, and the measured cost beside it. */}
+          <Text size="footnote" color={C.muted} wrap="truncate-end">
+            {[
+              'cost-weighted',
+              spentUsd !== undefined && spentUsd > 0 ? `≈${fmtUsd(spentUsd)} at API prices` : '',
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </Text>
         </Box>
         <Box flexDirection="column">
           {groups.map(x => (
@@ -1042,9 +1117,20 @@ export const register: Register = on => {
             </Box>
           ))}
         </Box>
-        <Text size="footnote" color={C.muted} wrap="truncate-end">
-          {fmtTok(tokens.input)} in · {fmtTok(tokens.output)} out{tokens.cached >= 1 ? ` · ${fmtTok(tokens.cached)} reread from cache` : ''}
-        </Text>
+        <Box flexDirection="column">
+          {meter.context && (
+            <Text size="footnote" color={C.muted} wrap="truncate-end">
+              Conversation {fmtTok(meter.context.tokens)} of {fmtTok(meter.context.window)}: every step rereads it
+            </Text>
+          )}
+          {total > 0 && (
+            <Text size="footnote" color={C.muted} wrap="truncate-end">
+              Raw tokens: {fmtTok(tokens.input)} new input · {fmtTok(tokens.output)} output
+              {tokens.writes >= 1 ? ` · ${fmtTok(tokens.writes)} saved to cache` : ''}
+              {tokens.cached >= 1 ? ` · ${fmtTok(tokens.cached)} reread from cache (cheap)` : ''}
+            </Text>
+          )}
+        </Box>
       </Box>
     )
 
